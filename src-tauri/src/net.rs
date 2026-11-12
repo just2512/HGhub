@@ -403,8 +403,8 @@ fn windows_proxy_diagnostics() -> Value {
     // WinINet connection blob 的 flags 字节：0x08 表示自动检测（WPAD）。仅提取该位。
     let connections = hkcu.open_subkey(format!(r"{path}\Connections")).ok();
     let connection_wpad = connections
-        .and_then(|key| key.get_value::<Vec<u8>, _>("DefaultConnectionSettings").ok())
-        .and_then(|bytes| bytes.get(8).copied())
+        .and_then(|key| key.get_raw_value("DefaultConnectionSettings").ok())
+        .and_then(|value| value.bytes.get(8).copied())
         .is_some_and(|flags| flags & 0x08 != 0);
     json!({
         "registry_readable": true,
