@@ -99,7 +99,9 @@ pub async fn line_add_custom(name: String, url: String) -> Result<Value, String>
     let origin = crate::net::normalize_base(&url).ok_or("数据源地址无效：必须是公网 HTTPS 站点根地址")?;
     crate::net::refresh_client();
     let data = crate::net::edge(&origin, "GET", "/api/videos?page=1&size=1", None, None).await?;
-    if data.is_null() { return Err("数据源 API 返回空数据，未保存".into()); }
+    if !data.get("items").is_some_and(Value::is_array) {
+        return Err("数据源 API 响应格式不兼容（缺少 items 数组），未保存".into());
+    }
     Ok(json!(crate::sources::add(&name, &origin)?))
 }
 #[tauri::command]
