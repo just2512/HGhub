@@ -607,6 +607,17 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
+    get_with_range(raw, timeout, accept, referer, None).await
+}
+
+/// GET 请求可选透传单段 Range；每次重定向仍重新执行目标校验和代理解析。
+async fn get_with_range(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    range: Option<&str>,
+) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
             crate::playback_log::record("network.target_failed", json!({"resource": crate::playback_log::resource_id(raw), "phase": phase, "error_kind": crate::playback_log::error_kind(&error)}));
@@ -631,6 +642,9 @@ pub async fn get(
             }
             if let Some(value) = referer {
                 request = request.header("Referer", value);
+            }
+            if let Some(value) = range {
+                request = request.header(reqwest::header::RANGE, value);
             }
             let response = request.send().await.map_err(|e| {
                 crate::playback_log::record(
@@ -1114,7 +1128,22 @@ pub async fn edge(
 }
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
+#[derive(Debug)]
+pub struct FetchedBytes {
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+    pub status: u16,
+    pub content_range: Option<String>,
+}
+
+/// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
+    let fetched = fetch_bytes_with_range(url, None).await?;
+    Ok((fetched.content_type, fetched.bytes))
+}
+
+/// 拉取 HLS 分片，可按需把浏览器发给本地协议的 Range 继续透传到 CDN。
+pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<FetchedBytes, String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
@@ -1124,12 +1153,14 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     let port = target.as_ref().and_then(|u| u.port_or_known_default());
     let mut attempt = 0;
     let url = url.to_string();
+    let range = range.map(str::to_owned);
     let referer = format!("{}/", base());
     with_retry(true, || {
         attempt += 1;
         let attempt = attempt;
         let resource = resource.clone();
         let url = url.clone();
+        let range = range.clone();
         let referer = referer.clone();
         let host = host.clone();
         let scheme = scheme.clone();
@@ -1137,62 +1168,46 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         async move {
             let started = Instant::now();
             crate::playback_log::record("network.begin", json!({
-                "request": request,
-                "resource": resource,
-                "attempt": attempt,
-                "host": host,
-                "scheme": scheme,
-                "port": port
+                "request": request, "resource": resource, "attempt": attempt,
+                "host": host, "scheme": scheme, "port": port, "range": range.is_some()
             }));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
+                let resp = get_with_range(&url, Duration::from_secs(20), None, Some(&referer), range.as_deref()).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
-                if !resp.status().is_success() {
+                let response_status = resp.status().as_u16();
+                if !resp.status().is_success() && !(range.is_some() && response_status == 416) {
                     return Err(format!("HTTP {}", resp.status()));
                 }
-                let ctype = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+                let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()).map(str::to_string);
+                let content_range = resp.headers().get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok()).map(str::to_string);
+                if response_status == 206 && content_range.is_none() {
+                    return Err("HTTP 206 缺少 Content-Range".into());
+                }
                 let bytes = resp.bytes().await.map_err(|e| {
-                    crate::playback_log::record(
-                        "network.transport_failed",
-                        json!({
-                            "host": host,
-                            "scheme": scheme,
-                            "port": port,
-                            "phase": "body",
-                            "error_kind": transport_error_kind(&e),
-                            "is_timeout": e.is_timeout(),
-                            "is_connect": e.is_connect(),
-                            "is_body": e.is_body(),
-                        }),
-                    );
+                    crate::playback_log::record("network.transport_failed", json!({
+                        "host": host, "scheme": scheme, "port": port, "phase": "body",
+                        "error_kind": transport_error_kind(&e), "is_timeout": e.is_timeout(),
+                        "is_connect": e.is_connect(), "is_body": e.is_body()
+                    }));
                     err_text(&e)
                 })?.to_vec();
-                Ok((ctype, bytes))
+                Ok(FetchedBytes { content_type: ctype, bytes, status: response_status, content_range })
             }.await;
             crate::playback_log::record("network.end", json!({
-                "request": request,
-                "resource": resource,
-                "attempt": attempt,
-                "host": host,
-                "scheme": scheme,
-                "port": port,
-                "status": status,
-                "headers_ms": headers_ms,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+                "request": request, "resource": resource, "attempt": attempt,
+                "host": host, "scheme": scheme, "port": port, "status": status,
+                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
+                "bytes": result.as_ref().ok().map(|fetched| fetched.bytes.len()),
                 "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))
             }));
             result
         }
-    })
-    .await
+    }).await
 }
 
 #[cfg(test)]
