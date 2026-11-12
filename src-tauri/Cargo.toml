@@ -49,7 +49,6 @@ winreg = "0.55"
 # Windows HTTPS also trusts roots installed in the Windows certificate store.
 # Keep rustls verification enabled; this only adds the OS trust roots.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
-winreg = "0.55"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
