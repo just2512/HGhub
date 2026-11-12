@@ -675,6 +675,10 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
+    let target = url::Url::parse(url).ok();
+    let host = target.as_ref().and_then(|u| u.host_str()).map(str::to_owned);
+    let scheme = target.as_ref().map(|u| u.scheme().to_string());
+    let port = target.as_ref().and_then(|u| u.port_or_known_default());
     let mut attempt = 0;
     let url = url.to_string();
     let referer = format!("{}/", base());
@@ -684,9 +688,19 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         let resource = resource.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let host = host.clone();
+        let scheme = scheme.clone();
+        let port = port;
         async move {
             let started = Instant::now();
-            crate::playback_log::record("network.begin", json!({"request": request, "resource": resource, "attempt": attempt}));
+            crate::playback_log::record("network.begin", json!({
+                "request": request,
+                "resource": resource,
+                "attempt": attempt,
+                "host": host,
+                "scheme": scheme,
+                "port": port
+            }));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
@@ -701,10 +715,37 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
+                let bytes = resp.bytes().await.map_err(|e| {
+                    crate::playback_log::record(
+                        "network.transport_failed",
+                        json!({
+                            "host": host,
+                            "scheme": scheme,
+                            "port": port,
+                            "phase": "body",
+                            "error_kind": transport_error_kind(&e),
+                            "is_timeout": e.is_timeout(),
+                            "is_connect": e.is_connect(),
+                            "is_body": e.is_body(),
+                        }),
+                    );
+                    err_text(&e)
+                })?.to_vec();
                 Ok((ctype, bytes))
             }.await;
-            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
+            crate::playback_log::record("network.end", json!({
+                "request": request,
+                "resource": resource,
+                "attempt": attempt,
+                "host": host,
+                "scheme": scheme,
+                "port": port,
+                "status": status,
+                "headers_ms": headers_ms,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+                "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))
+            }));
             result
         }
     })
