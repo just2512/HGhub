@@ -1,8 +1,6 @@
 name: Find N2 validation
 
 on:
-  push:
-    branches: [feat/find-n2-source-foldable]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -14,11 +12,11 @@ on:
       video_id:
         description: Public video ID with an available episode
         required: false
-        default: "117"
+        default: ""
       episode:
         description: Episode number
         required: false
-        default: "3"
+        default: ""
 
 permissions:
   contents: read
@@ -133,6 +131,6 @@ jobs:
       - name: Run real upstream playback acceptance (no fixtures)
         env:
           HGHUB_TEST_SOURCE: ${{ inputs.source || 'https://huangguoai.com' }}
-          HGHUB_TEST_VIDEO_ID: ${{ inputs.video_id || '117' }}
-          HGHUB_TEST_EPISODE: ${{ inputs.episode || '3' }}
+          HGHUB_TEST_VIDEO_ID: ${{ inputs.video_id || '' }}
+          HGHUB_TEST_EPISODE: ${{ inputs.episode || '' }}
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib media::tests::live_play_chain -- --ignored --nocapture

@@ -19,10 +19,10 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 真实上游 API 与媒体 CDN 验收（不是本地模拟）：
 
 ```sh
-HGHUB_TEST_SOURCE=https://huangguoai.com HGHUB_TEST_VIDEO_ID=117 HGHUB_TEST_EPISODE=3 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib media::tests::live_play_chain -- --ignored --nocapture
+HGHUB_TEST_SOURCE=https://huangguoai.com cargo test --locked --manifest-path src-tauri/Cargo.toml --lib media::tests::live_play_chain -- --ignored --nocapture
 ```
 
-该测试请求真实 Edge V1 播放 API，获取当次播放 URL，再通过 Rust 网络层获取 m3u8、重写后的 key/分片地址并下载真实分片字节。上游接口不可达、内容 ID/集数失效、CDN 拒绝或代理网络不可用时应如实失败；不得用本地样本替代并标记为真实通过。
+该测试先从实时首页选择一条有可用剧集的视频（也可通过 HGHUB_TEST_VIDEO_ID / HGHUB_TEST_EPISODE 指定），请求真实 Edge V1 播放 API，获取当次播放 URL，再通过 Rust 网络层获取 m3u8、重写后的 key/分片地址并下载真实分片字节；若播放列表包含 AES-128 key，还会实际下载并核对 16 字节密钥。上游接口不可达、内容 ID/集数失效、CDN 拒绝或代理网络不可用时应如实失败；不得用本地样本替代并标记为真实通过。
 
 ## Find N2 真机验收（必须安装 ARM64 APK）
 
