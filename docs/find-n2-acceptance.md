@@ -24,6 +24,10 @@ HGHUB_TEST_SOURCE=https://huangguoai.com cargo test --locked --manifest-path src
 
 该测试先从实时首页选择一条有可用剧集的视频（也可通过 HGHUB_TEST_VIDEO_ID / HGHUB_TEST_EPISODE 指定），请求真实 Edge V1 播放 API，获取当次播放 URL，再通过 Rust 网络层获取 m3u8、重写后的 key/分片地址并下载真实分片字节；若播放列表包含 AES-128 key，还会实际下载并核对 16 字节密钥。上游接口不可达、内容 ID/集数失效、CDN 拒绝或代理网络不可用时应如实失败；不得用本地样本替代并标记为真实通过。
 
+## 安装测试 APK
+
+CI APK 使用独立包名 com.hghub.huangguo.findn2test 和临时测试签名，可与正式版并存，不会覆盖正式版或清除正式版数据。首次安装可直接点击 APK 安装，或执行 adb install -r path/to/HGhub-N2-Test.apk。由于每次 CI 都会生成新的临时签名，更新测试版前需先执行 adb uninstall com.hghub.huangguo.findn2test，再安装新 APK。测试结束可执行同一卸载命令；正式版不受影响。
+
 ## Find N2 真机验收（必须安装 ARM64 APK）
 
 1. 外屏启动：冷启动、首页滚动、搜索、分类、设置与弹窗无裁切，底部导航不覆盖内容。

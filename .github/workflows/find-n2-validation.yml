@@ -83,6 +83,16 @@ jobs:
           workspaces: src-tauri -> target
           key: find-n2-android-arm64
       - run: pnpm install --frozen-lockfile
+      - name: Give test APK an isolated Android application identity
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'src-tauri/tauri.conf.json';
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+          config.identifier = config.identifier + '.findn2test';
+          config.productName = 'HGhub N2 Test';
+          fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+          NODE
       - run: pnpm tauri android init --ci
       - run: pnpm tauri android build --apk --target aarch64
       - name: Sign test APK with ephemeral CI key
