@@ -260,6 +260,22 @@ fn configured_proxy(
     }
 }
 
+/// PAC 下载/发现失败时使用静态配置；静态代理即使因 bypass 或 DIRECT 得到 None，
+/// 仍然是一个有效回退。只有显式 PAC 失败且没有静态代理配置时才 fail closed。
+fn pac_failure_fallback(
+    proxy_list: &str,
+    bypass_list: &str,
+    explicit_pac: bool,
+    target: &url::Url,
+) -> Result<Option<String>, String> {
+    let fallback = configured_proxy(proxy_list, bypass_list, target)
+        .map_err(|message| message.to_string())?;
+    if !proxy_list.trim().is_empty() || !explicit_pac {
+        return Ok(fallback);
+    }
+    Err("Windows PAC 代理解析失败；为避免绕过显式代理策略，媒体请求已阻止".into())
+}
+
 /// 按目标 URL 新建客户端。Windows PAC/WPAD 必须先经 WinHTTP 解析，
 /// 因为 reqwest 的 system-proxy 只读取固定代理，不执行浏览器的 PAC 脚本。
 fn build_client(
@@ -465,14 +481,14 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     };
     drop(session_cache);
     if !resolved {
-        // WinHTTP 无法取得 PAC/WPAD 结果时，先使用用户显式配置的静态代理及绕过名单。
-        // 若没有静态代理且配置了显式 PAC URL，则 fail closed，不能静默绕过代理策略。
-        let fallback = configured_proxy(&fixed_proxy, &fixed_bypass, target)
-            .map_err(|message| message.to_string())?;
-        if fallback.is_some() || pac_url.is_none() {
-            return Ok(Some(fallback));
-        }
-        return Err("Windows PAC 代理解析失败；为避免绕过显式代理策略，媒体请求已阻止".into());
+        // WinHTTP 无法取得 PAC/WPAD 结果时，使用当前用户配置的静态代理及绕过名单。
+        let fallback = pac_failure_fallback(
+            &fixed_proxy,
+            &fixed_bypass,
+            pac_url.is_some(),
+            target,
+        )?;
+        return Ok(Some(fallback));
     }
     let proxy = unsafe { take_wide(info.proxy) }.unwrap_or_default();
     let bypass = unsafe { take_wide(info.proxy_bypass) }.unwrap_or_default();
@@ -1205,6 +1221,31 @@ mod tests {
             None
         );
         assert!(configured_proxy("http=proxy-http:8080", "", &https).is_err());
+    }
+
+    #[test]
+    fn pac_failure_uses_static_direct_and_bypass_fallbacks() {
+        let target = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+
+        assert_eq!(
+            pac_failure_fallback(
+                "https=proxy.example:8443",
+                "media.example.net",
+                true,
+                &target
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            pac_failure_fallback("DIRECT", "", true, &target).unwrap(),
+            None
+        );
+        assert_eq!(
+            pac_failure_fallback("", "", false, &target).unwrap(),
+            None
+        );
+        assert!(pac_failure_fallback("", "", true, &target).is_err());
     }
 
     #[test]
