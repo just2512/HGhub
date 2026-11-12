@@ -1,6 +1,15 @@
 name: Windows media transport validation
 
 on:
+  push:
+    branches:
+      - fix/windows-media-transport-diagnostics
+    paths:
+      - "src-tauri/**"
+      - "src/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/windows-media-fix-validation.yml"
   pull_request:
     paths:
       - "src-tauri/**"
