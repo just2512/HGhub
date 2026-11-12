@@ -1,0 +1,95 @@
+name: Build and Publish Windows 11
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-windows11.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows11-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Windows x64 installer and portable build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $config = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+          "version=$($config.version)" >> $env:GITHUB_OUTPUT
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build NSIS installer
+        run: pnpm tauri build --bundles nsis
+
+      - name: Collect installer and portable executable
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter *.exe -ErrorAction Stop)
+          if ($installers.Count -lt 1) {
+            throw "NSIS installer was not generated"
+          }
+          foreach ($installer in $installers) {
+            Copy-Item $installer.FullName "artifacts/"
+          }
+
+          $portable = "src-tauri/target/release/huangguo-client.exe"
+          if (-not (Test-Path $portable)) {
+            $candidate = Get-ChildItem "src-tauri/target/release" -Filter *.exe | Select-Object -First 1
+            if ($null -eq $candidate) { throw "Portable executable was not found" }
+            $portable = $candidate.FullName
+          }
+          Copy-Item $portable "artifacts/HGhub.exe"
+          Compress-Archive -Path "artifacts/HGhub.exe" -DestinationPath "artifacts/HGhub_$($version)_windows_x64_portable.zip" -Force
+          Remove-Item "artifacts/HGhub.exe"
+
+          Get-ChildItem artifacts | Select-Object Name, Length
+          if ((Get-ChildItem artifacts -File).Count -lt 2) {
+            throw "Expected NSIS installer and portable ZIP"
+          }
+
+      - name: Publish Windows 11 prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows11-test-${{ github.run_number }}
+          name: HGhub Windows 11 Test Build ${{ steps.version.outputs.version }}
+          body: |
+            Windows x64 build produced on GitHub Actions windows-latest.
+
+            Includes NSIS installer and portable ZIP.
+            This is a test build; validate installation, startup, WebView2 runtime availability, playback and update behavior on Windows 11.
+          prerelease: true
+          make_latest: false
+          files: artifacts/*
+          fail_on_unmatched_files: true
