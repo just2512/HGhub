@@ -86,6 +86,7 @@ function AppBody() {
   const isMobile = platform === "android" || platform === "ios";
   const mainRef = useRef<HTMLDivElement>(null);
   const [wide, setWide] = useState(!isMobile);
+  const wideRef = useRef(wide);
   const [collapsed, setCollapsed] = useState(false);
 
   useLayoutEffect(() => {
@@ -98,13 +99,14 @@ function AppBody() {
       const nextWide = width > 640;
       el.dataset.layout = nextWide ? "wide" : "compact";
       el.style.setProperty("--app-viewport-height", `${height}px`);
-      setWide((previous) => {
-        if (previous !== nextWide) tracePlayback("viewport.layout", {
+      if (wideRef.current !== nextWide) {
+        wideRef.current = nextWide;
+        setWide(nextWide);
+        tracePlayback("viewport.layout", {
           width, height, layout: nextWide ? "wide" : "compact",
           orientation: window.innerWidth > window.innerHeight ? "landscape" : "portrait",
         });
-        return nextWide;
-      });
+      }
     };
     const ro = new ResizeObserver(updateLayout);
     ro.observe(el);
