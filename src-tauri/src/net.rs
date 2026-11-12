@@ -467,8 +467,8 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
         .map(|(_, http)| http.clone())
 }
 
-/// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
-/// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
+/// 客户端缓存按安全模式、主机、端口、已校验地址集合和代理决策隔离。
+/// DNS 缓存独立控制 30 秒校验窗口；地址变化时不会复用旧客户端。
 async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
@@ -502,7 +502,9 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
 
     // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
     let proxy_mode = proxy_for_target(&target)?;
-    let key = format!("{dns_key}:{}", proxy_mode.cache_fragment());
+    // DNS 重新校验后若地址集合变化，不得复用仍在 TTL 边界内的旧固定地址客户端。
+    let address_key = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let key = format!("{dns_key}:{address_key}:{}", proxy_mode.cache_fragment());
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
