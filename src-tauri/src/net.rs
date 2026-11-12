@@ -215,7 +215,15 @@ pub async fn get(
         for hop in 0..=5 {
             let resolving = Instant::now();
             let (target, http) = client_for(next.as_str()).await.map_err(|e| policy_error("dns_or_client", e))?;
-            crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
+            crate::playback_log::record("network.target_ready", json!({
+                "resource": crate::playback_log::resource_id(raw),
+                "target_resource": crate::playback_log::resource_id(target.as_str()),
+                "host": target.host_str(),
+                "scheme": target.scheme(),
+                "port": target.port_or_known_default(),
+                "dns_or_client_ms": resolving.elapsed().as_millis() as u64,
+                "hop": hop
+            }));
             let mut request = http.get(target.clone()).timeout(timeout);
             if let Some(value) = accept {
                 request = request.header("Accept", value);
@@ -223,7 +231,22 @@ pub async fn get(
             if let Some(value) = referer {
                 request = request.header("Referer", value);
             }
-            let response = request.send().await.map_err(|e| err_text(&e))?;
+            let response = request.send().await.map_err(|e| {
+                crate::playback_log::record(
+                    "network.transport_failed",
+                    json!({
+                        "host": target.host_str(),
+                        "scheme": target.scheme(),
+                        "port": target.port_or_known_default(),
+                        "phase": "send",
+                        "error_kind": transport_error_kind(&e),
+                        "is_timeout": e.is_timeout(),
+                        "is_connect": e.is_connect(),
+                        "is_request": e.is_request(),
+                    }),
+                );
+                err_text(&e)
+            })?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
             }
@@ -309,6 +332,40 @@ pub fn err_text(e: &reqwest::Error) -> String {
         src = s.source();
     }
     out
+}
+
+/// 将 reqwest 传输失败映射为不含 URL、证书正文或代理凭据的稳定诊断类别。
+pub fn transport_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        return "timeout";
+    }
+    if e.is_connect() {
+        let chain = err_text(e).to_ascii_lowercase();
+        if chain.contains("dns") || chain.contains("name or service not known") {
+            "dns_error"
+        } else if chain.contains("certificate")
+            || chain.contains("tls")
+            || chain.contains("handshake")
+        {
+            "tls_error"
+        } else if chain.contains("proxy") || chain.contains("tunnel") {
+            "proxy_error"
+        } else if chain.contains("refused") {
+            "connection_refused"
+        } else {
+            "connect_error"
+        }
+    } else if e.is_body() {
+        "body_error"
+    } else if e.is_decode() {
+        "decode_error"
+    } else if e.is_redirect() {
+        "redirect_error"
+    } else if e.is_request() {
+        "request_error"
+    } else {
+        "transport_error"
+    }
 }
 
 fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
