@@ -127,6 +127,39 @@ enum ProxyChoice {
     NoMatch,
 }
 
+#[derive(Clone, Debug)]
+enum ClientProxy {
+    System,
+    Direct,
+    Proxy(String),
+}
+
+impl ClientProxy {
+    fn cache_fragment(&self) -> String {
+        match self {
+            Self::System => "system".into(),
+            Self::Direct => "direct".into(),
+            Self::Proxy(proxy) => format!("proxy:{proxy}"),
+        }
+    }
+}
+
+/// 每次按完整目标 URL 解析 PAC，再按实际代理结果复用连接池。
+/// PAC 可以按路径或查询参数分流，因此不能在解析前仅按 host/port 命中客户端缓存。
+fn proxy_for_target(target: &url::Url) -> Result<ClientProxy, String> {
+    if let Some(proxy) = proxy_override() {
+        return Ok(ClientProxy::Proxy(proxy));
+    }
+    #[cfg(windows)]
+    if let Some(proxy) = windows_pac_proxy(target)? {
+        return Ok(match proxy {
+            Some(proxy) => ClientProxy::Proxy(proxy),
+            None => ClientProxy::Direct,
+        });
+    }
+    Ok(ClientProxy::System)
+}
+
 /// 解析 WinHTTP 返回的代理列表，并按目标协议选取对应项。
 fn choose_proxy(raw: &str, scheme: &str) -> ProxyChoice {
     let mut default_proxy = None;
@@ -216,7 +249,11 @@ fn configured_proxy(
 
 /// 按目标 URL 新建客户端。Windows PAC/WPAD 必须先经 WinHTTP 解析，
 /// 因为 reqwest 的 system-proxy 只读取固定代理，不执行浏览器的 PAC 脚本。
-fn build_client(target: &url::Url, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+fn build_client(
+    target: &url::Url,
+    addrs: &[SocketAddr],
+    proxy_mode: &ClientProxy,
+) -> Result<reqwest::Client, String> {
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let mut builder = reqwest::Client::builder()
         .user_agent(UA)
@@ -231,24 +268,18 @@ fn build_client(target: &url::Url, addrs: &[SocketAddr]) -> Result<reqwest::Clie
         builder = builder.resolve_to_addrs(host, addrs);
     }
 
-    if let Some(p) = proxy_override() {
-        // 用户显式代理优先于系统代理；不允许 system-proxy 再覆盖选择。
-        let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUB_PROXY 配置无效（已隐藏原始值）")?;
-        builder = builder.no_proxy().proxy(proxy);
-    } else {
-        #[cfg(windows)]
-        if let Some(proxy) = windows_pac_proxy(target)? {
-            match proxy {
-                Some(proxy_url) => {
-                    let proxy = reqwest::Proxy::all(&proxy_url)
-                        .map_err(|_| "Windows PAC 返回了无效代理（原始值已隐藏）")?;
-                    builder = builder.no_proxy().proxy(proxy);
-                }
-                None => {
-                    // PAC 明确返回 DIRECT，必须覆盖 reqwest 的固定代理自动探测。
-                    builder = builder.no_proxy();
-                }
-            }
+    match proxy_mode {
+        ClientProxy::System => {}
+        ClientProxy::Direct => {
+            // PAC 明确返回 DIRECT，必须覆盖 reqwest 的固定代理自动探测。
+            builder = builder.no_proxy();
+        }
+        ClientProxy::Proxy(proxy_url) => {
+            // 显式代理优先于系统代理；不允许 system-proxy 再覆盖 PAC/HGHUB_PROXY 选择。
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| {
+                "代理配置无效（原始值已隐藏）"
+            })?;
+            builder = builder.no_proxy().proxy(proxy);
         }
     }
     builder.build().map_err(|_| "无法创建 HTTP 客户端".to_string())
@@ -434,7 +465,9 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let key = format!("{strict}:{host}:{port}");
+    // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
+    let proxy_mode = proxy_for_target(&target)?;
+    let key = format!("{strict}:{host}:{port}:{}", proxy_mode.cache_fragment());
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
@@ -446,7 +479,7 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     } else {
         Vec::new()
     };
-    let http = Arc::new(build_client(&target, &addrs)?);
+    let http = Arc::new(build_client(&target, &addrs, &proxy_mode)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
     // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
