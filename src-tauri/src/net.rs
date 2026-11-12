@@ -151,6 +151,14 @@ impl ClientProxy {
             Self::Proxy(_) => "proxy",
         }
     }
+
+    /// 只记录代理协议类型，不记录代理主机、端口或认证信息。
+    fn diagnostic_proxy_scheme(&self) -> Option<String> {
+        match self {
+            Self::Proxy(raw) => url::Url::parse(raw).ok().map(|value| value.scheme().to_string()),
+            Self::System | Self::Direct => None,
+        }
+    }
 }
 
 /// 每次按完整目标 URL 解析 PAC，再按实际代理结果复用连接池。
@@ -595,7 +603,8 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     crate::playback_log::record("network.proxy_selected", json!({
         "host": host,
         "scheme": target.scheme(),
-        "mode": proxy_mode.diagnostic_mode()
+        "mode": proxy_mode.diagnostic_mode(),
+        "proxy_scheme": proxy_mode.diagnostic_proxy_scheme()
     }));
     // DNS 重新校验后若地址集合变化，不得复用仍在 TTL 边界内的旧固定地址客户端。
     let address_key = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
@@ -679,6 +688,7 @@ async fn get_with_range(
                 request = request.header(reqwest::header::RANGE, value);
             }
             let response = request.send().await.map_err(|e| {
+                let detail = err_text(&e);
                 crate::playback_log::record(
                     "network.transport_failed",
                     json!({
@@ -687,12 +697,13 @@ async fn get_with_range(
                         "port": target.port_or_known_default(),
                         "phase": "send",
                         "error_kind": transport_error_kind(&e),
+                        "detail_kind": transport_detail_kind(&detail),
                         "is_timeout": e.is_timeout(),
                         "is_connect": e.is_connect(),
                         "is_request": e.is_request(),
                     }),
                 );
-                err_text(&e)
+                detail
             })?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
@@ -820,6 +831,47 @@ pub fn transport_error_kind(e: &reqwest::Error) -> &'static str {
         "request_error"
     } else {
         "transport_error"
+    }
+}
+
+/// 将底层 TLS/代理错误归类为固定标签；不把证书、URL 或代理错误原文写入日志。
+fn transport_detail_kind(reason: &str) -> &'static str {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("unknownissuer") || reason.contains("unknown issuer") {
+        "certificate_unknown_issuer"
+    } else if reason.contains("notvalidforname")
+        || reason.contains("hostname mismatch")
+        || reason.contains("not valid for name")
+    {
+        "certificate_name_mismatch"
+    } else if reason.contains("certnotvalidyet")
+        || (reason.contains("certificate") && reason.contains("expired"))
+        || (reason.contains("certificate") && reason.contains("not yet valid"))
+    {
+        "certificate_time_invalid"
+    } else if reason.contains("certificate") && reason.contains("revoked") {
+        "certificate_revoked"
+    } else if reason.contains("certificate")
+        || reason.contains("invalid peer certificate")
+        || reason.contains("certificate verify failed")
+    {
+        "certificate_validation"
+    } else if reason.contains("proxy") || reason.contains("tunnel") {
+        "proxy_tunnel"
+    } else if reason.contains("alertreceived")
+        || reason.contains("handshake failure")
+        || reason.contains("handshake_failure")
+        || reason.contains("fatal alert")
+    {
+        "tls_alert"
+    } else if reason.contains("tls") || reason.contains("handshake") {
+        "tls_protocol"
+    } else if reason.contains("dns") || reason.contains("name or service not known") {
+        "dns_error"
+    } else if reason.contains("refused") {
+        "connection_refused"
+    } else {
+        "connect_error"
     }
 }
 
@@ -1322,12 +1374,15 @@ pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<Fe
                 let content_range = resp.headers().get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok()).map(str::to_string);
                 let bytes = resp.bytes().await.map_err(|e| {
+                    let detail = err_text(&e);
                     crate::playback_log::record("network.transport_failed", json!({
                         "host": host, "scheme": scheme, "port": port, "phase": "body",
-                        "error_kind": transport_error_kind(&e), "is_timeout": e.is_timeout(),
+                        "error_kind": transport_error_kind(&e),
+                        "detail_kind": transport_detail_kind(&detail),
+                        "is_timeout": e.is_timeout(),
                         "is_connect": e.is_connect(), "is_body": e.is_body()
                     }));
-                    err_text(&e)
+                    detail
                 })?.to_vec();
                 let (status, bytes, content_range) =
                     normalize_range_response(range.as_deref(), response_status, content_range, bytes)?;
@@ -1443,6 +1498,25 @@ mod tests {
         ] {
             assert!(!should_heal_client(error), "{error}");
         }
+    }
+
+    #[test]
+    fn transport_detail_kind_distinguishes_certificate_and_proxy_failures() {
+        for (reason, expected) in [
+            ("invalid peer certificate: UnknownIssuer", "certificate_unknown_issuer"),
+            ("certificate is not valid for name", "certificate_name_mismatch"),
+            ("certificate expired", "certificate_time_invalid"),
+            ("certificate revoked", "certificate_revoked"),
+            ("invalid peer certificate", "certificate_validation"),
+            ("proxy CONNECT tunnel failed", "proxy_tunnel"),
+            ("TLS handshake failure alert", "tls_alert"),
+            ("TLS handshake failed", "tls_protocol"),
+            ("dns error: failed lookup", "dns_error"),
+            ("connection refused", "connection_refused"),
+        ] {
+            assert_eq!(transport_detail_kind(reason), expected, "{reason}");
+        }
+        assert!(!transport_detail_kind("private-marker-secret").contains("secret"));
     }
 
     #[test]
