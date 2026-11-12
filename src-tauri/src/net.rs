@@ -194,7 +194,11 @@ fn proxy_choice(raw: &str) -> ProxyChoice {
 /// Windows 代理绕过规则：支持精确主机、*.domain、.domain、host:port 和 <local>。
 fn bypasses_host(list: &str, target: &url::Url) -> bool {
     let Some(host) = target.host_str() else { return false };
-    let host_lower = host.to_ascii_lowercase();
+    // url::Url 对 IPv6 host_str() 返回方括号形式；比较 bypass 规则时使用规范化裸地址。
+    let host_lower = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     list.split([';', ',', ' ', '\t'])
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -1179,6 +1183,8 @@ mod tests {
             ("http://192.168.1.5/", "<local>", false),
             ("http://[::1]/", "<local>", false),
             ("http://[2001:db8::1]/", "[2001:db8::1]", true),
+            ("http://[2001:db8::1]:8443/", "[2001:db8::1]:8443", true),
+            ("http://[2001:db8::2]/", "[2001:db8::1]", false),
         ];
         for (raw_url, bypass, expected) in urls {
             let target = url::Url::parse(raw_url).unwrap();
