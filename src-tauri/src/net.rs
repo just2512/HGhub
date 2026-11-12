@@ -200,7 +200,9 @@ fn bypasses_host(list: &str, target: &url::Url) -> bool {
         .filter(|v| !v.is_empty())
         .any(|raw_rule| {
             if raw_rule.eq_ignore_ascii_case("<local>") {
-                return host.parse::<std::net::IpAddr>().is_err() && !host.contains('.');
+                // Url::host_str() 保留 IPv6 方括号；剥离后再判断，避免把 ::1 当作本地名称。
+                let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+                return ip_candidate.parse::<std::net::IpAddr>().is_err() && !host.contains('.');
             }
 
             let (rule, rule_port) = if raw_rule.starts_with('[') {
