@@ -408,6 +408,39 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 mod tests {
     use super::*;
 
+    fn collect_live_hls_resources(
+        text: &str,
+        child_playlist: &mut Option<String>,
+        encryption_key: &mut Option<String>,
+        media_segment: &mut Option<String>,
+    ) {
+        for line in text.lines() {
+            if line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:") {
+                if let Some((_, attrs)) = hls_attributes(line) {
+                    if let Some(value) = attrs.iter().find_map(|attr| attr.trim().strip_prefix("URI=").map(str::trim)) {
+                        if let Ok(parsed) = url::Url::parse(value.trim_matches('"')) {
+                            if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
+                                *encryption_key = Some(target);
+                            }
+                        }
+                    }
+                }
+            } else if !line.starts_with('#') && !line.trim().is_empty() {
+                if let Ok(parsed) = url::Url::parse(line.trim()) {
+                    if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
+                        let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
+                        if path.ends_with(".m3u8") && child_playlist.is_none() {
+                            *child_playlist = Some(target);
+                        } else if media_segment.is_none() {
+                            *media_segment = Some(target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
         let line = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-11-07T00:00:00Z\",DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\",X-ASSET-URI=\"https://evil.example/ad\",X-ASSET-LIST=\"https://evil.example/list.json\"\n";
@@ -491,36 +524,15 @@ mod tests {
         let mut child_playlist: Option<String> = None;
         let mut encryption_key: Option<String> = None;
         let mut media_segment: Option<String> = None;
-        for line in master_text.lines() {
-            if line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:") {
-                if let Some((_, attrs)) = hls_attributes(line) {
-                    if let Some(value) = attrs.iter().find_map(|attr| attr.trim().strip_prefix("URI=").map(str::trim)) {
-                        if let Ok(parsed) = url::Url::parse(value.trim_matches('"')) {
-                            if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
-                                encryption_key = Some(target);
-                            }
-                        }
-                    }
-                }
-            } else if !line.starts_with('#') && !line.trim().is_empty() {
-                if let Ok(parsed) = url::Url::parse(line.trim()) {
-                    if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
-                        let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
-                        if path.ends_with(".m3u8") && child_playlist.is_none() {
-                            child_playlist = Some(target);
-                        } else if media_segment.is_none() {
-                            media_segment = Some(target);
-                        }
-                    }
-                }
-            }
-        }
+        collect_live_hls_resources(master_text, &mut child_playlist, &mut encryption_key, &mut media_segment);
 
         let mut child_verified = false;
         if let Some(target) = child_playlist {
             let child = handle("/seg", &format!("u={}", enc(&target)), LOCAL_ORIGIN).await;
             assert_eq!(child.status(), 200, "child playlist HTTP status");
-            assert!(child.body().starts_with(b"#EXTM3U"), "child playlist signature");
+            let child_text = std::str::from_utf8(child.body()).expect("child playlist UTF-8");
+            assert!(child_text.starts_with("#EXTM3U"), "child playlist signature");
+            collect_live_hls_resources(child_text, &mut None, &mut encryption_key, &mut media_segment);
             child_verified = true;
         }
 
