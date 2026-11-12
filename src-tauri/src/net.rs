@@ -170,16 +170,20 @@ fn bypasses_host(list: &str, target: &url::Url) -> bool {
                 return host.parse::<std::net::IpAddr>().is_err() && !host.contains('.');
             }
 
-            let rule = if raw_rule.starts_with('[') {
-                raw_rule
-                    .find(']')
-                    .map(|end| &raw_rule[1..end])
-                    .unwrap_or(raw_rule)
+            let (rule, rule_port) = if raw_rule.starts_with('[') {
+                let Some(end) = raw_rule.find(']') else { return false };
+                let rest = &raw_rule[end + 1..];
+                let port = rest.strip_prefix(':').and_then(|value| value.parse::<u16>().ok());
+                (&raw_rule[1..end], port)
             } else if raw_rule.matches(':').count() == 1 {
-                raw_rule.split(':').next().unwrap_or(raw_rule)
+                let (host, port) = raw_rule.split_once(':').unwrap();
+                (host, port.parse::<u16>().ok())
             } else {
-                raw_rule
+                (raw_rule, None)
             };
+            if rule_port.is_some_and(|port| target.port_or_known_default() != Some(port)) {
+                return false;
+            }
             let wildcard = rule.starts_with("*.");
             let suffix = rule.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
             if wildcard || raw_rule.starts_with('.') {
@@ -1099,7 +1103,8 @@ mod tests {
             ("https://example.com/", "*.example.com", true),
             ("https://cdn.example.com/", "*.example.com", true),
             ("https://notexample.com/", "*.example.com", false),
-            ("https://example.com:8443/", "example.com:443", true),
+            ("https://example.com:8443/", "example.com:443", false),
+            ("https://example.com:443/", "example.com:443", true),
             ("http://printer/", "<local>", true),
             ("http://192.168.1.5/", "<local>", false),
             ("http://[::1]/", "<local>", false),
