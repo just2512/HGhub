@@ -310,7 +310,7 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         } else {
             0
         },
-        auto_config_url: pac_url.as_ref().map_or(null_mut(), |v| wide(v).as_mut_ptr()),
+        auto_config_url: null_mut(),
         reserved: null_mut(),
         reserved2: 0,
         auto_logon_if_challenged: 1,
