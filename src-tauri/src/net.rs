@@ -328,7 +328,12 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     };
     unsafe { WinHttpCloseHandle(session); }
     if !resolved {
-        return Err("Windows PAC/WPAD 代理解析失败；为避免错误直连，媒体请求已阻止".into());
+        if pac_url.is_none() {
+            // WPAD 自动发现未找到 PAC 时，Windows 的常见语义是回退 DIRECT；
+            // 显式 PAC URL 解析失败则不能静默绕过企业代理。
+            return Ok(Some(None));
+        }
+        return Err("Windows PAC 代理解析失败；为避免绕过显式代理策略，媒体请求已阻止".into());
     }
     let proxy = unsafe { take_wide(info.proxy) }.unwrap_or_default();
     let bypass = unsafe { take_wide(info.proxy_bypass) }.unwrap_or_default();
