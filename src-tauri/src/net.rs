@@ -313,7 +313,7 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         auto_config_url: null_mut(),
         reserved: null_mut(),
         reserved2: 0,
-        auto_logon_if_challenged: 1,
+        auto_logon_if_challenged: 0,
     };
     // 保留 PAC URL 的 UTF-16 缓冲区，直到 WinHttpGetProxyForUrl 返回。
     let pac_wide = pac_url.as_ref().map(|v| wide(v));
