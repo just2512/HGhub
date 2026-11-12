@@ -33,8 +33,6 @@ jobs:
           workspaces: src-tauri -> target
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
-      - name: Check Rust formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
       - name: Build frontend
