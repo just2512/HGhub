@@ -146,16 +146,23 @@ impl ClientProxy {
 
 /// 每次按完整目标 URL 解析 PAC，再按实际代理结果复用连接池。
 /// PAC 可以按路径或查询参数分流，因此不能在解析前仅按 host/port 命中客户端缓存。
-fn proxy_for_target(target: &url::Url) -> Result<ClientProxy, String> {
+async fn proxy_for_target(target: &url::Url) -> Result<ClientProxy, String> {
     if let Some(proxy) = proxy_override() {
         return Ok(ClientProxy::Proxy(proxy));
     }
     #[cfg(windows)]
-    if let Some(proxy) = windows_pac_proxy(target)? {
-        return Ok(match proxy {
-            Some(proxy) => ClientProxy::Proxy(proxy),
-            None => ClientProxy::Direct,
-        });
+    {
+        // WinHttpGetProxyForUrl 是同步阻塞 API；不得阻塞 Tokio 的异步工作线程。
+        let target = target.clone();
+        if let Some(proxy) = tokio::task::spawn_blocking(move || windows_pac_proxy(&target))
+            .await
+            .map_err(|_| "Windows PAC 解析任务异常退出".to_string())??
+        {
+            return Ok(match proxy {
+                Some(proxy) => ClientProxy::Proxy(proxy),
+                None => ClientProxy::Direct,
+            });
+        }
     }
     Ok(ClientProxy::System)
 }
@@ -350,6 +357,11 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         fn GlobalFree(memory: *mut c_void) -> *mut c_void;
     }
 
+    // WinHTTP 在同一个 session 中缓存自动发现结果与 PAC 脚本。
+    // 复用 session 避免每个 HLS 分片都重新发现/下载 PAC；配置变化或 5 分钟后刷新。
+    static WINHTTP_SESSION: Lazy<Mutex<(usize, String, Instant)>> =
+        Lazy::new(|| Mutex::new((0, String::new(), Instant::now())));
+
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -383,18 +395,42 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     }
 
     let agent = wide(UA);
-    let session = unsafe {
-        WinHttpOpen(
-            agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_NO_PROXY,
-            null(),
-            null(),
-            0,
-        )
-    };
-    if session.is_null() {
-        return Err("Windows PAC 解析器初始化失败".into());
+    let config_key = format!(
+        "{}|{}",
+        pac_url.as_deref().unwrap_or(""),
+        config.auto_detect
+    );
+    let mut session_cache = WINHTTP_SESSION
+        .lock()
+        .map_err(|_| "Windows PAC session 锁失败")?;
+    if session_cache.0 == 0
+        || session_cache.1 != config_key
+        || Instant::now() >= session_cache.2
+    {
+        if session_cache.0 != 0 {
+            unsafe { WinHttpCloseHandle(session_cache.0 as InternetHandle); }
+        }
+        let opened = unsafe {
+            WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
+                null(),
+                null(),
+                0,
+            )
+        };
+        if opened.is_null() {
+            *session_cache = (0, String::new(), Instant::now());
+            return Err("Windows PAC 解析器初始化失败".into());
+        }
+        *session_cache = (
+            opened as usize,
+            config_key,
+            Instant::now() + Duration::from_secs(300),
+        );
     }
+    // 保持锁直到本次 WinHttpGetProxyForUrl 返回，避免并发访问/关闭同一 session。
+    let session = session_cache.0 as InternetHandle;
     let target_wide = wide(target.as_str());
     // 当前用户可能同时启用了 PAC URL 和自动检测；保留两种已配置的发现方式。
     let mut flags = 0;
@@ -427,7 +463,7 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     let resolved = unsafe {
         WinHttpGetProxyForUrl(session, target_wide.as_ptr(), &mut options, &mut info) != 0
     };
-    unsafe { WinHttpCloseHandle(session); }
+    drop(session_cache);
     if !resolved {
         // WinHTTP 无法取得 PAC/WPAD 结果时，先使用用户显式配置的静态代理及绕过名单。
         // 若没有静态代理且配置了显式 PAC URL，则 fail closed，不能静默绕过代理策略。
@@ -507,7 +543,7 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     };
 
     // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
-    let proxy_mode = proxy_for_target(&target)?;
+    let proxy_mode = proxy_for_target(&target).await?;
     // DNS 重新校验后若地址集合变化，不得复用仍在 TTL 边界内的旧固定地址客户端。
     let address_key = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
     let key = format!("{dns_key}:{address_key}:{}", proxy_mode.cache_fragment());
