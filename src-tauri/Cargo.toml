@@ -46,6 +46,9 @@ url = "2"
 # 三者均已是 tao/wry 的间接依赖，版本与 Cargo.lock 一致；只开启用到的 feature。
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
+# Windows HTTPS also trusts roots installed in the Windows certificate store.
+# Keep rustls verification enabled; this only adds the OS trust roots.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

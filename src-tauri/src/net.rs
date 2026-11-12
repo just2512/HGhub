@@ -120,12 +120,203 @@ fn proxy_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 按**当前**系统代理设置新建一个客户端。
-///
-/// 注意：reqwest 的 `system-proxy` 只在构建时读一次注册表 / 环境变量。代理软件被关掉后，
-/// 旧客户端仍会往 `127.0.0.1:7897` 建隧道，症状是满屏 `tunnel error: failed to create
-/// underlying connection`（浏览器却是通的，因为它每次都重读系统代理）。所以这里允许重建。
-fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyChoice {
+    Direct,
+    Proxy(String),
+    NoMatch,
+}
+
+#[derive(Clone, Debug)]
+enum ClientProxy {
+    System,
+    Direct,
+    Proxy(String),
+}
+
+impl ClientProxy {
+    fn cache_fragment(&self) -> String {
+        match self {
+            Self::System => "system".into(),
+            Self::Direct => "direct".into(),
+            Self::Proxy(proxy) => format!("proxy:{proxy}"),
+        }
+    }
+
+    /// 日志只记录代理使用模式，不记录地址、用户名或认证信息。
+    fn diagnostic_mode(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Direct => "direct",
+            Self::Proxy(_) => "proxy",
+        }
+    }
+
+    /// 只记录代理协议类型，不记录代理主机、端口或认证信息。
+    fn diagnostic_proxy_scheme(&self) -> Option<String> {
+        match self {
+            Self::Proxy(raw) => url::Url::parse(raw).ok().map(|value| value.scheme().to_string()),
+            Self::System | Self::Direct => None,
+        }
+    }
+}
+
+/// 每次按完整目标 URL 解析 PAC，再按实际代理结果复用连接池。
+/// PAC 可以按路径或查询参数分流，因此不能在解析前仅按 host/port 命中客户端缓存。
+async fn proxy_for_target(target: &url::Url) -> Result<ClientProxy, String> {
+    if let Some(proxy) = proxy_override() {
+        return Ok(ClientProxy::Proxy(proxy));
+    }
+    #[cfg(windows)]
+    {
+        // WinHttpGetProxyForUrl 是同步阻塞 API；不得阻塞 Tokio 的异步工作线程。
+        let target = target.clone();
+        if let Some(proxy) = tokio::task::spawn_blocking(move || windows_pac_proxy(&target))
+            .await
+            .map_err(|_| "Windows PAC 解析任务异常退出".to_string())??
+        {
+            return Ok(match proxy {
+                Some(proxy) => ClientProxy::Proxy(proxy),
+                None => ClientProxy::Direct,
+            });
+        }
+    }
+    Ok(ClientProxy::System)
+}
+
+/// 解析 WinHTTP 返回的代理列表，并按目标协议选取对应项。
+fn choose_proxy(raw: &str, scheme: &str) -> ProxyChoice {
+    let mut default_proxy = None;
+    for entry in raw.split([';', ' ', '\t']).map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some((protocol, value)) = entry.split_once('=') {
+            if protocol.trim().eq_ignore_ascii_case(scheme) {
+                return proxy_choice(value);
+            }
+        } else if default_proxy.is_none() {
+            default_proxy = Some(entry);
+        }
+    }
+    default_proxy.map(proxy_choice).unwrap_or(ProxyChoice::NoMatch)
+}
+
+fn proxy_choice(raw: &str) -> ProxyChoice {
+    let selected = raw.trim();
+    if selected.is_empty() {
+        return ProxyChoice::NoMatch;
+    }
+    if selected.eq_ignore_ascii_case("DIRECT") {
+        return ProxyChoice::Direct;
+    }
+    let url = if selected.contains("://") {
+        selected.to_string()
+    } else {
+        format!("http://{selected}")
+    };
+    ProxyChoice::Proxy(url)
+}
+
+/// Windows 代理绕过规则：支持精确主机、*.domain、.domain、host:port 和 <local>。
+fn bypasses_host(list: &str, target: &url::Url) -> bool {
+    let Some(host) = target.host_str() else { return false };
+    // url::Url 对 IPv6 host_str() 返回方括号形式；比较 bypass 规则时使用规范化裸地址。
+    let host_lower = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    list.split([';', ',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .any(|raw_rule| {
+            if raw_rule.eq_ignore_ascii_case("<local>") {
+                // Url::host_str() 保留 IPv6 方括号；剥离后再判断，避免把 ::1 当作本地名称。
+                let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+                return ip_candidate.parse::<std::net::IpAddr>().is_err() && !host.contains('.');
+            }
+
+            let (rule, rule_port) = if raw_rule.starts_with('[') {
+                let Some(end) = raw_rule.find(']') else { return false };
+                let rest = &raw_rule[end + 1..];
+                let port = rest.strip_prefix(':').and_then(|value| value.parse::<u16>().ok());
+                (&raw_rule[1..end], port)
+            } else if raw_rule.matches(':').count() == 1 {
+                let (host, port) = raw_rule.split_once(':').unwrap();
+                (host, port.parse::<u16>().ok())
+            } else {
+                (raw_rule, None)
+            };
+            if rule_port.is_some_and(|port| target.port_or_known_default() != Some(port)) {
+                return false;
+            }
+            let wildcard = rule.starts_with("*.");
+            let suffix = rule.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+            if wildcard || raw_rule.starts_with('.') {
+                host_lower == suffix || host_lower.ends_with(&format!(".{suffix}"))
+            } else {
+                host_lower == suffix
+            }
+        })
+}
+
+/// 将用户配置中的固定代理作为 PAC/WPAD 无法取得结果时的回退。
+/// 静态绕过规则和代理设置来自同一份当前用户配置。
+fn configured_proxy(
+    proxy_list: &str,
+    bypass_list: &str,
+    target: &url::Url,
+) -> Result<Option<String>, &'static str> {
+    if bypasses_host(bypass_list, target) {
+        return Ok(None);
+    }
+    if proxy_list.trim().is_empty() {
+        return Ok(None);
+    }
+    match choose_proxy(proxy_list, target.scheme()) {
+        ProxyChoice::Direct => Ok(None),
+        ProxyChoice::Proxy(proxy) => Ok(Some(proxy)),
+        ProxyChoice::NoMatch => Err("Windows 固定代理未配置当前 URL 协议"),
+    }
+}
+
+/// PAC/WPAD 均未启用时，优先使用 WinHttpGetIEProxyConfigForCurrentUser
+/// 返回的固定代理；无固定代理配置时才交给 reqwest 的 system-proxy。
+/// 返回 None 表示没有可显式采用的固定代理，Some(None) 表示明确 DIRECT。
+fn fixed_proxy_decision(
+    proxy_list: &str,
+    bypass_list: &str,
+    target: &url::Url,
+) -> Result<Option<Option<String>>, String> {
+    if proxy_list.trim().is_empty() {
+        return Ok(None);
+    }
+    configured_proxy(proxy_list, bypass_list, target)
+        .map(Some)
+        .map_err(|message| message.to_string())
+}
+
+/// PAC 下载/发现失败时使用静态配置；静态代理即使因 bypass 或 DIRECT 得到 None，
+/// 仍然是一个有效回退。只有显式 PAC 失败且没有静态代理配置时才 fail closed。
+fn pac_failure_fallback(
+    proxy_list: &str,
+    bypass_list: &str,
+    explicit_pac: bool,
+    target: &url::Url,
+) -> Result<Option<String>, String> {
+    let fallback = configured_proxy(proxy_list, bypass_list, target)
+        .map_err(|message| message.to_string())?;
+    if !proxy_list.trim().is_empty() || !explicit_pac {
+        return Ok(fallback);
+    }
+    Err("Windows PAC 代理解析失败；为避免绕过显式代理策略，媒体请求已阻止".into())
+}
+
+/// 按目标 URL 新建客户端。Windows PAC/WPAD 必须先经 WinHTTP 解析，
+/// 因为 reqwest 的 system-proxy 只读取固定代理，不执行浏览器的 PAC 脚本。
+fn build_client(
+    target: &url::Url,
+    addrs: &[SocketAddr],
+    proxy_mode: &ClientProxy,
+) -> Result<reqwest::Client, String> {
+    let host = target.host_str().ok_or("目标缺少主机名")?;
     let mut builder = reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
@@ -138,19 +329,234 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
     if !addrs.is_empty() {
         builder = builder.resolve_to_addrs(host, addrs);
     }
-    if let Some(p) = proxy_override() {
-        // 错误信息不能含原始代理 URL（其中可能有用户名/密码）。
-        let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUB_PROXY 配置无效（已隐藏原始值）")?;
-        builder = builder.proxy(proxy);
+
+    match proxy_mode {
+        ClientProxy::System => {}
+        ClientProxy::Direct => {
+            // PAC 明确返回 DIRECT，必须覆盖 reqwest 的固定代理自动探测。
+            builder = builder.no_proxy();
+        }
+        ClientProxy::Proxy(proxy_url) => {
+            // 显式代理优先于系统代理；不允许 system-proxy 再覆盖 PAC/HGHUB_PROXY 选择。
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| {
+                "代理配置无效（原始值已隐藏）"
+            })?;
+            builder = builder.no_proxy().proxy(proxy);
+        }
     }
-    builder
-        .build()
-        .map_err(|_| "无法创建 HTTP 客户端".to_string())
+    builder.build().map_err(|_| "无法创建 HTTP 客户端".to_string())
+}
+
+#[cfg(windows)]
+fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String> {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    type InternetHandle = *mut c_void;
+    const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+    const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+    const WINHTTP_AUTOPROXY_AUTO_DETECT: u32 = 0x00000001;
+    const WINHTTP_AUTOPROXY_CONFIG_URL: u32 = 0x00000002;
+    const WINHTTP_AUTO_DETECT_TYPE_DHCP: u32 = 0x00000001;
+    const WINHTTP_AUTO_DETECT_TYPE_DNS_A: u32 = 0x00000002;
+
+    #[repr(C)]
+    struct IeProxyConfig {
+        auto_detect: i32,
+        auto_config_url: *mut u16,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+    #[repr(C)]
+    struct AutoProxyOptions {
+        flags: u32,
+        auto_detect_flags: u32,
+        auto_config_url: *mut u16,
+        reserved: *mut c_void,
+        reserved2: u32,
+        auto_logon_if_challenged: i32,
+    }
+    #[repr(C)]
+    struct ProxyInfo {
+        access_type: u32,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+
+    #[link(name = "winhttp")]
+    unsafe extern "system" {
+        fn WinHttpOpen(
+            agent: *const u16,
+            access_type: u32,
+            proxy: *const u16,
+            bypass: *const u16,
+            flags: u32,
+        ) -> InternetHandle;
+        fn WinHttpGetIEProxyConfigForCurrentUser(config: *mut IeProxyConfig) -> i32;
+        fn WinHttpGetProxyForUrl(
+            session: InternetHandle,
+            url: *const u16,
+            options: *mut AutoProxyOptions,
+            info: *mut ProxyInfo,
+        ) -> i32;
+        fn WinHttpCloseHandle(handle: InternetHandle) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    unsafe fn take_wide(value: *mut u16) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        GlobalFree(value.cast());
+        Some(result)
+    }
+    let mut config = IeProxyConfig {
+        auto_detect: 0,
+        auto_config_url: null_mut(),
+        proxy: null_mut(),
+        proxy_bypass: null_mut(),
+    };
+    let loaded = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut config) != 0 };
+    if !loaded {
+        return Ok(None);
+    }
+    let pac_url = unsafe { take_wide(config.auto_config_url) };
+    let fixed_proxy = unsafe { take_wide(config.proxy) }.unwrap_or_default();
+    let fixed_bypass = unsafe { take_wide(config.proxy_bypass) }.unwrap_or_default();
+    if pac_url.is_none() && config.auto_detect == 0 {
+        // 用户明确启用了 Windows 固定代理时，不能退回未经验证的
+        // reqwest System 模式；直接采用 WinINet 当前用户返回的 proxy/bypass。
+        return fixed_proxy_decision(&fixed_proxy, &fixed_bypass, target);
+    }
+
+    let agent = wide(UA);
+    let config_key = format!(
+        "{}|{}",
+        pac_url.as_deref().unwrap_or(""),
+        config.auto_detect
+    );
+    let mut session_cache = WINHTTP_SESSION
+        .lock()
+        .map_err(|_| "Windows PAC session 锁失败")?;
+    let reset_requested =
+        WINHTTP_SESSION_RESET.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if reset_requested
+        || session_cache.0 == 0
+        || session_cache.1 != config_key
+        || Instant::now() >= session_cache.2
+    {
+        if session_cache.0 != 0 {
+            unsafe { WinHttpCloseHandle(session_cache.0 as InternetHandle); }
+        }
+        let opened = unsafe {
+            WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
+                null(),
+                null(),
+                0,
+            )
+        };
+        if opened.is_null() {
+            *session_cache = (0, String::new(), Instant::now());
+            return Err("Windows PAC 解析器初始化失败".into());
+        }
+        *session_cache = (
+            opened as usize,
+            config_key,
+            Instant::now() + Duration::from_secs(300),
+        );
+    }
+    // 保持锁直到本次 WinHttpGetProxyForUrl 返回，避免并发访问/关闭同一 session。
+    let session = session_cache.0 as InternetHandle;
+    let target_wide = wide(target.as_str());
+    // 当前用户可能同时启用了 PAC URL 和自动检测；保留两种已配置的发现方式。
+    let mut flags = 0;
+    if pac_url.is_some() {
+        flags |= WINHTTP_AUTOPROXY_CONFIG_URL;
+    }
+    if config.auto_detect != 0 {
+        flags |= WINHTTP_AUTOPROXY_AUTO_DETECT;
+    }
+    let mut options = AutoProxyOptions {
+        flags,
+        auto_detect_flags: if config.auto_detect != 0 {
+            WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
+        } else {
+            0
+        },
+        auto_config_url: null_mut(),
+        reserved: null_mut(),
+        reserved2: 0,
+        auto_logon_if_challenged: 0,
+    };
+    // 保留 PAC URL 的 UTF-16 缓冲区，直到 WinHttpGetProxyForUrl 返回。
+    let pac_wide = pac_url.as_ref().map(|v| wide(v));
+    options.auto_config_url = pac_wide.as_ref().map_or(null_mut(), |v| v.as_ptr() as *mut u16);
+    let mut info = ProxyInfo {
+        access_type: 0,
+        proxy: null_mut(),
+        proxy_bypass: null_mut(),
+    };
+    let resolved = unsafe {
+        WinHttpGetProxyForUrl(session, target_wide.as_ptr(), &mut options, &mut info) != 0
+    };
+    drop(session_cache);
+    if !resolved {
+        // WinHTTP 无法取得 PAC/WPAD 结果时，使用当前用户配置的静态代理及绕过名单。
+        let fallback = pac_failure_fallback(
+            &fixed_proxy,
+            &fixed_bypass,
+            pac_url.is_some(),
+            target,
+        )?;
+        return Ok(Some(fallback));
+    }
+    let proxy = unsafe { take_wide(info.proxy) }.unwrap_or_default();
+    let bypass = unsafe { take_wide(info.proxy_bypass) }.unwrap_or_default();
+    if info.access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY {
+        return Ok(Some(None));
+    }
+    configured_proxy(&proxy, &bypass, target)
+        .map(Some)
+        .map_err(|message| message.to_string())
+}
+
+#[cfg(not(windows))]
+fn windows_pac_proxy(_target: &url::Url) -> Result<Option<Option<String>>, String> {
+    Ok(None)
 }
 
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
+type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static VERIFIED_DNS: Lazy<Mutex<DnsCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(windows)]
+static WINHTTP_SESSION: Lazy<Mutex<(usize, String, Instant)>> =
+    Lazy::new(|| Mutex::new((0, String::new(), Instant::now())));
+#[cfg(windows)]
+static WINHTTP_SESSION_RESET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn cached_dns(cache: &DnsCache, key: &str, now: Instant) -> Option<Vec<SocketAddr>> {
+    cache
+        .get(key)
+        .filter(|(expires, _)| now < *expires)
+        .map(|(_, addrs)| addrs.clone())
+}
 
 fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
     cache
@@ -159,26 +565,57 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
         .map(|(_, http)| http.clone())
 }
 
-/// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
-/// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
+/// 客户端缓存按安全模式、主机、端口、已校验地址集合和代理决策隔离。
+/// DNS 缓存独立控制 30 秒校验窗口；地址变化时不会复用旧客户端。
 async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let key = format!("{strict}:{host}:{port}");
+    let dns_key = format!("{strict}:{host}:{port}");
+    // 先复用或重新校验 DNS 结果，再执行可能联网的 PAC/WPAD 解析。
+    // DNS 结果与客户端分开缓存，避免 PAC 按路径分流时绕过目标地址安全检查。
+    let addrs = if strict {
+        let cached = {
+            let cache = VERIFIED_DNS.lock().map_err(|_| "DNS 缓存锁失败")?;
+            cached_dns(&cache, &dns_key, Instant::now())
+        };
+        match cached {
+            Some(addrs) => addrs,
+            None => {
+                let addrs = network_policy::resolve_target(&target, strict).await?;
+                let now = Instant::now();
+                let mut cache = VERIFIED_DNS.lock().map_err(|_| "DNS 缓存锁失败")?;
+                cache.retain(|_, (expires, _)| now < *expires);
+                if cache.len() >= 64 {
+                    cache.clear();
+                }
+                cache.insert(dns_key.clone(), (now + CLIENT_TTL, addrs.clone()));
+                addrs
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
+    let proxy_mode = proxy_for_target(&target).await?;
+    crate::playback_log::record("network.proxy_selected", json!({
+        "host": host,
+        "scheme": target.scheme(),
+        "mode": proxy_mode.diagnostic_mode(),
+        "proxy_scheme": proxy_mode.diagnostic_proxy_scheme()
+    }));
+    // DNS 重新校验后若地址集合变化，不得复用仍在 TTL 边界内的旧固定地址客户端。
+    let address_key = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let key = format!("{dns_key}:{address_key}:{}", proxy_mode.cache_fragment());
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
             return Ok((target, http));
         }
     }
-    let addrs = if strict {
-        network_policy::resolve_target(&target, strict).await?
-    } else {
-        Vec::new()
-    };
-    let http = Arc::new(build_client(host, &addrs)?);
+    let http = Arc::new(build_client(&target, &addrs, &proxy_mode)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
     // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
@@ -197,6 +634,11 @@ pub fn refresh_client() {
     if let Ok(mut cache) = CLIENTS.lock() {
         cache.clear();
     }
+    if let Ok(mut cache) = VERIFIED_DNS.lock() {
+        cache.clear();
+    }
+    #[cfg(windows)]
+    WINHTTP_SESSION_RESET.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// 不可信 GET 的统一入口；自动重定向被关闭，每一跳重新检查 URL、DNS 并固定解析地址。
@@ -205,6 +647,17 @@ pub async fn get(
     timeout: Duration,
     accept: Option<&str>,
     referer: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    get_with_range(raw, timeout, accept, referer, None).await
+}
+
+/// GET 请求可选透传单段 Range；每次重定向仍重新执行目标校验和代理解析。
+async fn get_with_range(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    range: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
@@ -231,7 +684,11 @@ pub async fn get(
             if let Some(value) = referer {
                 request = request.header("Referer", value);
             }
+            if let Some(value) = range {
+                request = request.header(reqwest::header::RANGE, value);
+            }
             let response = request.send().await.map_err(|e| {
+                let detail = err_text(&e);
                 crate::playback_log::record(
                     "network.transport_failed",
                     json!({
@@ -240,12 +697,13 @@ pub async fn get(
                         "port": target.port_or_known_default(),
                         "phase": "send",
                         "error_kind": transport_error_kind(&e),
+                        "detail_kind": transport_detail_kind(&detail),
                         "is_timeout": e.is_timeout(),
                         "is_connect": e.is_connect(),
                         "is_request": e.is_request(),
                     }),
                 );
-                err_text(&e)
+                detail
             })?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
@@ -293,14 +751,22 @@ pub fn is_proxy_error(e: &str) -> bool {
 static LAST_HEAL: Lazy<std::sync::Mutex<Option<Instant>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
+/// 判断需要重建客户端的传输错误。reqwest/hyper 的错误链通常使用小写
+/// "tcp connect error"，因此必须先统一大小写，不能只匹配 "Connect"。
+fn should_heal_client(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("tunnel")
+        || reason.contains("proxy")
+        || reason.contains("connect")
+        || reason.contains("timed out")
+        || reason.contains("refused")
+        || reason.contains("dns")
+}
+
 /// 请求失败后按需重建客户端：代理隧道错误、连接被拒 / 超时都算「网络环境可能变了」。
 /// 3 秒内只重建一次，批量探测不会反复重建。
 pub fn heal_client(reason: &str) {
-    let connectish = reason.contains("Connect")
-        || reason.contains("timed out")
-        || reason.contains("refused")
-        || reason.contains("dns");
-    if !is_proxy_error(reason) && !connectish {
+    if !should_heal_client(reason) {
         return;
     }
     let mut last = match LAST_HEAL.lock() {
@@ -365,6 +831,47 @@ pub fn transport_error_kind(e: &reqwest::Error) -> &'static str {
         "request_error"
     } else {
         "transport_error"
+    }
+}
+
+/// 将底层 TLS/代理错误归类为固定标签；不把证书、URL 或代理错误原文写入日志。
+fn transport_detail_kind(reason: &str) -> &'static str {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("unknownissuer") || reason.contains("unknown issuer") {
+        "certificate_unknown_issuer"
+    } else if reason.contains("notvalidforname")
+        || reason.contains("hostname mismatch")
+        || reason.contains("not valid for name")
+    {
+        "certificate_name_mismatch"
+    } else if reason.contains("certnotvalidyet")
+        || (reason.contains("certificate") && reason.contains("expired"))
+        || (reason.contains("certificate") && reason.contains("not yet valid"))
+    {
+        "certificate_time_invalid"
+    } else if reason.contains("certificate") && reason.contains("revoked") {
+        "certificate_revoked"
+    } else if reason.contains("certificate")
+        || reason.contains("invalid peer certificate")
+        || reason.contains("certificate verify failed")
+    {
+        "certificate_validation"
+    } else if reason.contains("proxy") || reason.contains("tunnel") {
+        "proxy_tunnel"
+    } else if reason.contains("alertreceived")
+        || reason.contains("handshake failure")
+        || reason.contains("handshake_failure")
+        || reason.contains("fatal alert")
+    {
+        "tls_alert"
+    } else if reason.contains("tls") || reason.contains("handshake") {
+        "tls_protocol"
+    } else if reason.contains("dns") || reason.contains("name or service not known") {
+        "dns_error"
+    } else if reason.contains("refused") {
+        "connection_refused"
+    } else {
+        "connect_error"
     }
 }
 
@@ -705,7 +1212,126 @@ pub async fn edge(
 }
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
+#[derive(Debug)]
+pub struct FetchedBytes {
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+    pub status: u16,
+    pub content_range: Option<String>,
+}
+
+/// 解析单段 Range，并根据完整实体长度得到实际的闭区间。
+fn resolve_byte_range(value: &str, total: u64) -> Result<Option<(u64, u64)>, String> {
+    let spec = value.strip_prefix("bytes=").ok_or("不支持的 Range 单位")?;
+    if spec.contains(',') {
+        return Err("不支持多段 Range".into());
+    }
+    let (start, end) = spec.split_once('-').ok_or("Range 格式无效")?;
+    if end.contains('-') {
+        return Err("Range 格式无效".into());
+    }
+    if total == 0 {
+        return Ok(None);
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| "Range 后缀长度无效")?;
+        if suffix == 0 {
+            return Err("Range 后缀长度不能为零".into());
+        }
+        let length = suffix.min(total);
+        return Ok(Some((total - length, total - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| "Range 起始位置无效")?;
+    let requested_end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().map_err(|_| "Range 结束位置无效")?
+    };
+    if requested_end < start || start >= total {
+        return Ok(None);
+    }
+    Ok(Some((start, requested_end.min(total - 1))))
+}
+
+/// 校验上游 206，或在上游忽略 Range 返回完整 200 时本地切片。
+/// 这保证 BYTERANGE 得到的永远是所请求的字节区间，而不是整份文件。
+fn normalize_range_response(
+    range: Option<&str>,
+    status: u16,
+    content_range: Option<String>,
+    bytes: Vec<u8>,
+) -> Result<(u16, Vec<u8>, Option<String>), String> {
+    let Some(range) = range else {
+        if status == 206 {
+            let header = content_range.as_deref().ok_or("HTTP 206 缺少 Content-Range")?;
+            let (start, end, total) = parse_content_range(header)?;
+            let expected_len = end - start + 1;
+            if total <= end || bytes.len() as u64 != expected_len {
+                return Err("HTTP 206 的 Content-Range 与响应字节数不一致".into());
+            }
+        }
+        return Ok((status, bytes, content_range));
+    };
+
+    match status {
+        200 => {
+            let total = u64::try_from(bytes.len()).map_err(|_| "媒体响应过大")?;
+            match resolve_byte_range(range, total)? {
+                Some((start, end)) => {
+                    let part = bytes[start as usize..=end as usize].to_vec();
+                    let header = format!("bytes {start}-{end}/{total}");
+                    Ok((206, part, Some(header)))
+                }
+                None => Ok((416, Vec::new(), Some(format!("bytes */{total}")))),
+            }
+        }
+        206 => {
+            let header = content_range.as_deref().ok_or("HTTP 206 缺少 Content-Range")?;
+            let (actual_start, actual_end, total) = parse_content_range(header)?;
+            let expected = resolve_byte_range(range, total)?
+                .ok_or("上游返回了不可满足的 Range 响应")?;
+            if (actual_start, actual_end) != expected {
+                return Err("上游 HTTP 206 返回的字节区间与请求不一致".into());
+            }
+            if bytes.len() as u64 != actual_end - actual_start + 1 {
+                return Err("上游 HTTP 206 的 Content-Range 与响应字节数不一致".into());
+            }
+            Ok((206, bytes, content_range))
+        }
+        416 => {
+            let header = content_range.as_deref().ok_or("HTTP 416 缺少 Content-Range")?;
+            let total = header
+                .strip_prefix("bytes */")
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("HTTP 416 的 Content-Range 无效")?;
+            Ok((416, bytes, Some(format!("bytes */{total}"))))
+        }
+        _ => Err(format!("上游未正确处理 Range：HTTP {status}")),
+    }
+}
+
+/// 解析 RFC 9110 的单段 Content-Range（仅接受已知实体总长度）。
+fn parse_content_range(value: &str) -> Result<(u64, u64, u64), String> {
+    let spec = value.strip_prefix("bytes ").ok_or("Content-Range 单位无效")?;
+    let (range, total) = spec.split_once('/').ok_or("Content-Range 缺少总长度")?;
+    let total = total.parse::<u64>().map_err(|_| "Content-Range 总长度无效")?;
+    let (start, end) = range.split_once('-').ok_or("Content-Range 区间无效")?;
+    let start = start.parse::<u64>().map_err(|_| "Content-Range 起始位置无效")?;
+    let end = end.parse::<u64>().map_err(|_| "Content-Range 结束位置无效")?;
+    if total == 0 || end < start || end >= total {
+        return Err("Content-Range 区间越界".into());
+    }
+    Ok((start, end, total))
+}
+
+/// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
+    let fetched = fetch_bytes_with_range(url, None).await?;
+    Ok((fetched.content_type, fetched.bytes))
+}
+
+/// 拉取 HLS 分片，可按需把浏览器发给本地协议的 Range 继续透传到 CDN。
+pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<FetchedBytes, String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
@@ -715,12 +1341,14 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     let port = target.as_ref().and_then(|u| u.port_or_known_default());
     let mut attempt = 0;
     let url = url.to_string();
+    let range = range.map(str::to_owned);
     let referer = format!("{}/", base());
     with_retry(true, || {
         attempt += 1;
         let attempt = attempt;
         let resource = resource.clone();
         let url = url.clone();
+        let range = range.clone();
         let referer = referer.clone();
         let host = host.clone();
         let scheme = scheme.clone();
@@ -728,67 +1356,276 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         async move {
             let started = Instant::now();
             crate::playback_log::record("network.begin", json!({
-                "request": request,
-                "resource": resource,
-                "attempt": attempt,
-                "host": host,
-                "scheme": scheme,
-                "port": port
+                "request": request, "resource": resource, "attempt": attempt,
+                "host": host, "scheme": scheme, "port": port, "range": range.is_some()
             }));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
+                let resp = get_with_range(&url, Duration::from_secs(20), None, Some(&referer), range.as_deref()).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
-                if !resp.status().is_success() {
+                let response_status = resp.status().as_u16();
+                if !resp.status().is_success() && !(range.is_some() && response_status == 416) {
                     return Err(format!("HTTP {}", resp.status()));
                 }
-                let ctype = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
+                let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()).map(str::to_string);
+                let content_range = resp.headers().get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok()).map(str::to_string);
                 let bytes = resp.bytes().await.map_err(|e| {
-                    crate::playback_log::record(
-                        "network.transport_failed",
-                        json!({
-                            "host": host,
-                            "scheme": scheme,
-                            "port": port,
-                            "phase": "body",
-                            "error_kind": transport_error_kind(&e),
-                            "is_timeout": e.is_timeout(),
-                            "is_connect": e.is_connect(),
-                            "is_body": e.is_body(),
-                        }),
-                    );
-                    err_text(&e)
+                    let detail = err_text(&e);
+                    crate::playback_log::record("network.transport_failed", json!({
+                        "host": host, "scheme": scheme, "port": port, "phase": "body",
+                        "error_kind": transport_error_kind(&e),
+                        "detail_kind": transport_detail_kind(&detail),
+                        "is_timeout": e.is_timeout(),
+                        "is_connect": e.is_connect(), "is_body": e.is_body()
+                    }));
+                    detail
                 })?.to_vec();
-                Ok((ctype, bytes))
+                let (status, bytes, content_range) =
+                    normalize_range_response(range.as_deref(), response_status, content_range, bytes)?;
+                Ok(FetchedBytes { content_type: ctype, bytes, status, content_range })
             }.await;
             crate::playback_log::record("network.end", json!({
-                "request": request,
-                "resource": resource,
-                "attempt": attempt,
-                "host": host,
-                "scheme": scheme,
-                "port": port,
-                "status": status,
-                "headers_ms": headers_ms,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-                "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+                "request": request, "resource": resource, "attempt": attempt,
+                "host": host, "scheme": scheme, "port": port, "status": status,
+                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
+                "bytes": result.as_ref().ok().map(|fetched| fetched.bytes.len()),
                 "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))
             }));
             result
         }
-    })
-    .await
+    }).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_fallback_slices_full_200_responses() {
+        let source = b"0123456789";
+        let (status, bytes, content_range) = normalize_range_response(
+            Some("bytes=3-6"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(bytes, b"3456");
+        assert_eq!(content_range.as_deref(), Some("bytes 3-6/10"));
+    }
+
+    #[test]
+    fn range_fallback_supports_open_ended_and_suffix_ranges() {
+        let source = b"0123456789";
+        let (status, open, header) = normalize_range_response(
+            Some("bytes=8-"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(open, b"89");
+        assert_eq!(header.as_deref(), Some("bytes 8-9/10"));
+
+        let (status, suffix, header) = normalize_range_response(
+            Some("bytes=-3"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(suffix, b"789");
+        assert_eq!(header.as_deref(), Some("bytes 7-9/10"));
+    }
+
+    #[test]
+    fn range_fallback_returns_416_when_requested_start_is_out_of_bounds() {
+        let (status, bytes, header) = normalize_range_response(
+            Some("bytes=20-30"),
+            200,
+            None,
+            b"0123456789".to_vec(),
+        ).unwrap();
+        assert_eq!(status, 416);
+        assert!(bytes.is_empty());
+        assert_eq!(header.as_deref(), Some("bytes */10"));
+    }
+
+    #[test]
+    fn upstream_partial_range_must_match_requested_bytes_and_body_length() {
+        let ok = normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 3-6/10".into()),
+            b"3456".to_vec(),
+        ).unwrap();
+        assert_eq!(ok.0, 206);
+        assert_eq!(ok.1, b"3456");
+
+        assert!(normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 2-5/10".into()),
+            b"2345".to_vec(),
+        ).is_err());
+        assert!(normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 3-6/10".into()),
+            b"345".to_vec(),
+        ).is_err());
+    }
+
+    #[test]
+    fn connection_recovery_matches_lowercase_transport_errors() {
+        for error in [
+            "error sending request: tcp connect error: connection reset",
+            "proxy CONNECT tunnel failed",
+            "connection refused",
+            "operation timed out",
+            "dns error: failed to lookup address",
+        ] {
+            assert!(should_heal_client(error), "{error}");
+        }
+        for error in [
+            "HTTP 403 Forbidden",
+            "certificate validation failed",
+            "HTTP 404 Not Found",
+        ] {
+            assert!(!should_heal_client(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn transport_detail_kind_distinguishes_certificate_and_proxy_failures() {
+        for (reason, expected) in [
+            ("invalid peer certificate: UnknownIssuer", "certificate_unknown_issuer"),
+            ("certificate is not valid for name", "certificate_name_mismatch"),
+            ("certificate expired", "certificate_time_invalid"),
+            ("certificate revoked", "certificate_revoked"),
+            ("invalid peer certificate", "certificate_validation"),
+            ("proxy CONNECT tunnel failed", "proxy_tunnel"),
+            ("TLS handshake failure alert", "tls_alert"),
+            ("TLS handshake failed", "tls_protocol"),
+            ("dns error: failed lookup", "dns_error"),
+            ("connection refused", "connection_refused"),
+        ] {
+            assert_eq!(transport_detail_kind(reason), expected, "{reason}");
+        }
+        assert!(!transport_detail_kind("private-marker-secret").contains("secret"));
+    }
+
+    #[test]
+    fn proxy_selection_respects_target_scheme_and_direct_decisions() {
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080;https=proxy-https:8443", "https"),
+            ProxyChoice::Proxy("http://proxy-https:8443".into())
+        );
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080;https=proxy-https:8443", "http"),
+            ProxyChoice::Proxy("http://proxy-http:8080".into())
+        );
+        assert_eq!(
+            choose_proxy("https://proxy.example:9443", "https"),
+            ProxyChoice::Proxy("https://proxy.example:9443".into())
+        );
+        assert_eq!(choose_proxy("DIRECT", "https"), ProxyChoice::Direct);
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080", "https"),
+            ProxyChoice::NoMatch
+        );
+    }
+
+    #[test]
+    fn static_proxy_fallback_honors_bypass_and_fails_closed_on_scheme_mismatch() {
+        let https = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+        assert_eq!(
+            configured_proxy("http=proxy-http:8080;https=proxy-https:8443", "", &https).unwrap(),
+            Some("http://proxy-https:8443".into())
+        );
+        assert_eq!(
+            configured_proxy("proxy.example:8080", "media.example.net", &https).unwrap(),
+            None
+        );
+        assert_eq!(
+            configured_proxy("", "<local>", &url::Url::parse("http://printer/").unwrap()).unwrap(),
+            None
+        );
+        assert!(configured_proxy("http=proxy-http:8080", "", &https).is_err());
+    }
+
+    #[test]
+    fn fixed_proxy_is_selected_when_pac_and_wpad_are_disabled() {
+        let target = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+
+        assert_eq!(
+            fixed_proxy_decision(
+                "http=proxy-http:8080;https=127.0.0.1:7890",
+                "",
+                &target
+            ).unwrap(),
+            Some(Some("http://127.0.0.1:7890".into()))
+        );
+        assert_eq!(
+            fixed_proxy_decision(
+                "127.0.0.1:7890",
+                "media.example.net",
+                &target
+            ).unwrap(),
+            Some(None)
+        );
+        assert_eq!(fixed_proxy_decision("", "", &target).unwrap(), None);
+    }
+
+    #[test]
+    fn pac_failure_uses_static_direct_and_bypass_fallbacks() {
+        let target = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+
+        assert_eq!(
+            pac_failure_fallback(
+                "https=proxy.example:8443",
+                "media.example.net",
+                true,
+                &target
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            pac_failure_fallback("DIRECT", "", true, &target).unwrap(),
+            None
+        );
+        assert_eq!(
+            pac_failure_fallback("", "", false, &target).unwrap(),
+            None
+        );
+        assert!(pac_failure_fallback("", "", true, &target).is_err());
+    }
+
+    #[test]
+    fn proxy_bypass_matches_domains_ports_and_local_hosts_without_misclassifying_ip() {
+        let urls = [
+            ("https://example.com/", "*.example.com", true),
+            ("https://cdn.example.com/", "*.example.com", true),
+            ("https://notexample.com/", "*.example.com", false),
+            ("https://example.com:8443/", "example.com:443", false),
+            ("https://example.com:443/", "example.com:443", true),
+            ("http://printer/", "<local>", true),
+            ("http://192.168.1.5/", "<local>", false),
+            ("http://[::1]/", "<local>", false),
+            ("http://[2001:db8::1]/", "[2001:db8::1]", true),
+            ("http://[2001:db8::1]:8443/", "[2001:db8::1]:8443", true),
+            ("http://[2001:db8::2]/", "[2001:db8::1]", false),
+        ];
+        for (raw_url, bypass, expected) in urls {
+            let target = url::Url::parse(raw_url).unwrap();
+            assert_eq!(bypasses_host(bypass, &target), expected, "{raw_url} / {bypass}");
+        }
+    }
 
     #[tokio::test]
     async fn terminal_errors_do_not_retry_but_transient_failures_can_recover() {
@@ -872,6 +1709,18 @@ mod tests {
             dns_summary(Vec::<SocketAddr>::new()),
             json!({"count":0,"has_fake_ip":false})
         );
+    }
+
+    #[test]
+    fn verified_dns_cache_expires_at_its_original_ttl() {
+        let now = Instant::now();
+        let key = "true:media.example.net:443";
+        let addrs = vec!["203.0.113.10:443".parse().unwrap()];
+        let mut cache = DnsCache::new();
+        cache.insert(key.into(), (now + CLIENT_TTL, addrs.clone()));
+        assert_eq!(cached_dns(&cache, key, now + Duration::from_secs(29)), Some(addrs));
+        assert!(cached_dns(&cache, key, now + CLIENT_TTL).is_none());
+        assert!(cached_dns(&cache, "false:media.example.net:443", now).is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! 所以图片与视频统一走本地自定义协议（Windows/Android 为 `http://hg.localhost`，
 //! macOS 为 `hg://localhost`，见 [`LOCAL_ORIGIN`]）。
 
-use crate::net::fetch_bytes;
+use crate::net::{fetch_bytes, fetch_bytes_with_range};
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
@@ -259,16 +259,44 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
     map_uri_attributes(line, |uri| absolutize(base, uri))
 }
 
-/// 加载分片或 AES Key（带内存缓存，避免拖动进度条时重复拉取同一 Key 或分片导致卡顿）。
-pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
-    if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
-        return Ok((Some(ctype), hit));
+/// 仅接受单段 HTTP byte-range；hls.js 的 HLS BYTERANGE 请求使用此格式。
+fn valid_byte_range(value: &str) -> bool {
+    if value.len() > 100 {
+        return false;
     }
-    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
-        return Ok((Some(ctype), hit));
+    let Some(spec) = value.strip_prefix("bytes=") else { return false };
+    if spec.contains(',') {
+        return false;
     }
-    let (ctype, bytes) = fetch_bytes(url).await?;
-    let mime = ctype.clone().unwrap_or_else(|| {
+    let Some((start, end)) = spec.split_once('-') else { return false };
+    if end.contains('-') {
+        return false;
+    }
+    if start.is_empty() {
+        return end.parse::<u64>().is_ok_and(|suffix| suffix > 0);
+    }
+    let Ok(start) = start.parse::<u64>() else { return false };
+    if end.is_empty() {
+        return true;
+    }
+    end.parse::<u64>().is_ok_and(|end| end >= start)
+}
+
+/// 加载分片或 AES Key。Range 响应不进入完整分片缓存，防止局部字节污染整段缓存。
+pub async fn load_segment(
+    url: &str,
+    range: Option<&str>,
+) -> Result<(Option<String>, Arc<Vec<u8>>, u16, Option<String>), String> {
+    if range.is_none() {
+        if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
+            return Ok((Some(ctype), hit, 200, None));
+        }
+        if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
+            return Ok((Some(ctype), hit, 200, None));
+        }
+    }
+    let fetched = fetch_bytes_with_range(url, range).await?;
+    let mime = fetched.content_type.clone().unwrap_or_else(|| {
         let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
         if p.ends_with(".ts") {
             "video/mp2t".to_string()
@@ -278,14 +306,16 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
             "application/octet-stream".to_string()
         }
     });
-    let len = bytes.len();
-    let arc = Arc::new(bytes);
-    if len <= 65536 {
-        cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
-    } else if len <= SEG_CACHE_MAX_BYTES {
-        cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+    let len = fetched.bytes.len();
+    let arc = Arc::new(fetched.bytes);
+    if range.is_none() {
+        if len <= 65536 {
+            cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
+        } else if len <= SEG_CACHE_MAX_BYTES {
+            cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+        }
     }
-    Ok((Some(mime), arc))
+    Ok((Some(mime), arc, fetched.status, fetched.content_range))
 }
 
 /// 清空封面 / 播放列表 / 分片内存缓存
@@ -299,17 +329,29 @@ pub fn clear_caches() {
 /* ───────────────────────── 协议响应 ───────────────────────── */
 
 fn respond(status: u16, ctype: &str, body: Vec<u8>, cache: &str) -> Response<Vec<u8>> {
+    respond_with_range(status, ctype, body, cache, None)
+}
+
+fn respond_with_range(
+    status: u16,
+    ctype: &str,
+    body: Vec<u8>,
+    cache: &str,
+    content_range: Option<&str>,
+) -> Response<Vec<u8>> {
     let len = body.len().to_string();
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
         .header("Content-Type", ctype)
         .header("Content-Length", len)
         .header("Accept-Ranges", "bytes")
         .header("X-Content-Type-Options", "nosniff")
-        .header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Accept-Ranges")
-        .header("Cache-Control", cache)
-        .body(body)
-        .unwrap_or_else(|_| Response::new(Vec::new()))
+        .header("Access-Control-Expose-Headers", "Content-Length, Content-Type, Accept-Ranges, Content-Range")
+        .header("Cache-Control", cache);
+    if let Some(value) = content_range {
+        builder = builder.header("Content-Range", value);
+    }
+    builder.body(body).unwrap_or_else(|_| Response::new(Vec::new()))
 }
 
 /// 主清单的子清单也经 /seg 返回：必须继续改写，不能把内层 URL 原样交给播放器。
@@ -318,17 +360,21 @@ fn segment_response(
     ctype: Option<&str>,
     bytes: Vec<u8>,
     origin: &str,
+    status: u16,
+    content_range: Option<&str>,
 ) -> Response<Vec<u8>> {
     let playlist = ctype.is_some_and(|t| t.to_ascii_lowercase().contains("mpegurl"))
         || bytes.starts_with(b"#EXTM3U")
         || bytes.starts_with(b"\xef\xbb\xbf#EXTM3U");
     if playlist {
+        if status != 200 {
+            return respond(502, "text/plain", b"partial HLS playlist response is invalid".to_vec(), "no-store");
+        }
         return match std::str::from_utf8(&bytes) {
             Ok(text) => respond(
                 200,
                 "application/vnd.apple.mpegurl",
                 rewrite_playlist(target, text, origin).into_bytes(),
-                // Rewriting nested URIs does not require disabling the upstream cache policy.
                 "public, max-age=3600",
             ),
             Err(_) => respond(
@@ -339,11 +385,15 @@ fn segment_response(
             ),
         };
     }
-    respond(
-        200,
+    if status == 206 && content_range.is_none() {
+        return respond(502, "text/plain", b"upstream 206 missing Content-Range".to_vec(), "no-store");
+    }
+    respond_with_range(
+        status,
         ctype.unwrap_or("application/octet-stream"),
         bytes,
         "public, max-age=3600",
+        content_range,
     )
 }
 
@@ -352,6 +402,16 @@ fn segment_response(
 /// `origin` 是本平台自定义协议的完整基址，见 [`LOCAL_ORIGIN`]；用于改写 m3u8 里的
 /// 分片与 key 地址。正常情况下调用方直接传 [`LOCAL_ORIGIN`]。
 pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> {
+    handle_with_range(path, query, origin, None).await
+}
+
+/// Tauri 本地媒体协议入口；Range 仅应用于 HLS 分片/字节范围资源。
+pub async fn handle_with_range(
+    path: &str,
+    query: &str,
+    origin: &str,
+    range: Option<&str>,
+) -> Response<Vec<u8>> {
     let target = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("u="))
@@ -389,11 +449,17 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
             ),
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
-        "/seg" => match load_segment(&target).await {
-            Ok((ctype, bytes)) => {
-                segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin)
+        "/seg" => {
+            if range.is_some_and(|value| !valid_byte_range(value)) {
+                respond(400, "text/plain", b"invalid byte range".to_vec(), "no-store")
+            } else {
+                match load_segment(&target, range).await {
+                    Ok((ctype, bytes, status, content_range)) => {
+                        segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin, status, content_range.as_deref())
+                    }
+                    Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+                }
             }
-            Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),
     };
@@ -446,6 +512,45 @@ mod tests {
     }
 
     #[test]
+    fn validates_single_hls_byte_ranges() {
+        for valid in ["bytes=0-99", "bytes=100-", "bytes=-256"] {
+            assert!(valid_byte_range(valid), "{valid}");
+        }
+        for invalid in ["bytes=", "bytes=-0", "bytes=9-2", "bytes=0-1,4-5", "items=0-1", "bytes=0-1-2"] {
+            assert!(!valid_byte_range(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn segment_response_preserves_partial_content_status_and_range() {
+        let response = segment_response(
+            "https://cdn.example/video.mp4",
+            Some("video/mp4"),
+            b"0123456789".to_vec(),
+            LOCAL_ORIGIN,
+            206,
+            Some("bytes 10-19/100"),
+        );
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body(), b"0123456789");
+        assert_eq!(response.headers()["Content-Range"], "bytes 10-19/100");
+        assert_eq!(response.headers()["Content-Length"], "10");
+    }
+
+    #[test]
+    fn rejects_partial_playlist_before_uri_rewrite() {
+        let response = segment_response(
+            "https://cdn.example/child.m3u8",
+            Some("application/vnd.apple.mpegurl"),
+            b"#EXTM3U".to_vec(),
+            LOCAL_ORIGIN,
+            206,
+            Some("bytes 0-6/100"),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
         let line = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-11-07T00:00:00Z\",DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\",X-ASSET-URI=\"https://evil.example/ad\",X-ASSET-LIST=\"https://evil.example/list.json\"\n";
         let out = rewrite_playlist("https://cdn.example/master.m3u8", line, LOCAL_ORIGIN);
@@ -475,6 +580,8 @@ mod tests {
             Some("application/octet-stream"),
             text.as_bytes().to_vec(),
             LOCAL_ORIGIN,
+            200,
+            None,
         );
         let body = std::str::from_utf8(response.body()).unwrap();
         assert_eq!(body.matches(&format!("{LOCAL_ORIGIN}/seg?u=")).count(), 4);
@@ -497,6 +604,8 @@ mod tests {
             None,
             b"\xef\xbb\xbf#EXTM3U\nsegment.ts\n".to_vec(),
             LOCAL_ORIGIN,
+            200,
+            None,
         );
         assert!(bom.body().starts_with(b"#EXTM3U\n"));
     }
