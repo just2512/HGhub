@@ -5,6 +5,12 @@ on:
     branches: [main]
     paths:
       - .github/workflows/build-windows11.yml
+      - src-tauri/**
+      - src/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - vite.config.ts
   workflow_dispatch:
 
 permissions:

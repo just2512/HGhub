@@ -408,6 +408,43 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 mod tests {
     use super::*;
 
+    fn collect_live_hls_resources(
+        text: &str,
+        child_playlist: &mut Option<String>,
+        encryption_key: &mut Option<String>,
+        media_segment: &mut Option<String>,
+    ) {
+        for line in text.lines() {
+            if line.starts_with('#') {
+                if let Some((tag, attrs)) = hls_attributes(line) {
+                    if let Some(value) = attrs.iter().find_map(|attr| attr.trim().strip_prefix("URI=").map(str::trim)) {
+                        if let Ok(parsed) = url::Url::parse(value.trim_matches('"')) {
+                            if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
+                                let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
+                                if tag == "#EXT-X-KEY" || tag == "#EXT-X-SESSION-KEY" {
+                                    *encryption_key = Some(target);
+                                } else if path.ends_with(".m3u8") && child_playlist.is_none() {
+                                    *child_playlist = Some(target);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if !line.trim().is_empty() {
+                if let Ok(parsed) = url::Url::parse(line.trim()) {
+                    if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
+                        let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
+                        if path.ends_with(".m3u8") && child_playlist.is_none() {
+                            *child_playlist = Some(target);
+                        } else if media_segment.is_none() {
+                            *media_segment = Some(target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
         let line = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-11-07T00:00:00Z\",DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\",X-ASSET-URI=\"https://evil.example/ad\",X-ASSET-LIST=\"https://evil.example/list.json\"\n";
@@ -466,45 +503,98 @@ mod tests {
 
     /// 联网测试：默认跳过，手动跑 `cargo test --lib -- --ignored`。
     /// 依赖上游 `/api/videos/117/play` 返回的实时播放地址。
+    /// 联网验收：分别验证主清单、可用时的子清单/KEY，以及至少一个媒体分片。
+    /// 仅输出状态和字节数，不输出带签名的媒体 URL。
     #[tokio::test]
-    #[ignore = "联网测试：依赖上游实时播放地址，手动用 --ignored 运行"]
+    #[ignore = "联网验收：依赖上游实时播放地址，手动用 --ignored 运行"]
     async fn live_play_chain() {
         use crate::net::edge;
-        let play = edge(
-            &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
+        let origin = crate::net::base();
+        // Mirror api_play(): the current upstream prefers POST /episodes/{ep}/playback.
+        // The legacy GET endpoint is only a fallback when the primary response has no stream.
+        let primary = edge(
+            &origin,
+            "POST",
+            "/api/videos/117/episodes/3/playback",
+            Some(serde_json::json!({})),
             None,
         )
-        .await
-        .expect("play api");
-        let url = play["video_url"].as_str().expect("video_url").to_string();
-        println!("play url: {}", &url[..url.len().min(90)]);
-        let (_, bytes) = fetch_bytes(&url).await.expect("fetch playlist");
-        let text = String::from_utf8_lossy(&bytes);
-        println!(
-            "raw playlist len={} head={}",
-            text.len(),
-            &text[..text.len().min(160)]
-        );
-        let q = format!("u={}", enc(&url));
-        let resp = handle("/hls", &q, LOCAL_ORIGIN).await;
-        let body = String::from_utf8_lossy(resp.body()).to_string();
-        println!("proxied status={} len={}", resp.status(), body.len());
-        assert!(body.contains("#EXTM3U"));
-        // 取一个分片验证
-        let seg_line = body
-            .lines()
-            .find(|l| !l.starts_with('#') && l.contains("/seg?u="))
-            .expect("seg line")
+        .await;
+        let has_stream = |value: &serde_json::Value| {
+            value
+                .get("video_url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| !url.is_empty())
+                || value
+                    .get("streams")
+                    .and_then(|streams| streams.get("main"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+        };
+        let play = match primary {
+            Ok(value) if has_stream(&value) => value,
+            primary_result => {
+                let legacy = edge(
+                    &origin,
+                    "GET",
+                    "/api/videos/117/play?ep=3&page_texts=0",
+                    None,
+                    None,
+                )
+                .await;
+                match legacy {
+                    Ok(value) if has_stream(&value) => value,
+                    _ => primary_result.expect("primary playback API returned no stream"),
+                }
+            }
+        };
+        let url = play
+            .get("video_url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| play.get("streams").and_then(|streams| streams.get("main")).and_then(serde_json::Value::as_str))
+            .filter(|value| !value.is_empty())
+            .expect("play response contains video_url or streams.main")
             .to_string();
-        println!("seg line: {}", &seg_line[..seg_line.len().min(120)]);
-        let seg_q = seg_line.split("?u=").nth(1).unwrap();
-        let seg = handle("/seg", &format!("u={seg_q}"), LOCAL_ORIGIN).await;
-        println!("segment status={} len={}", seg.status(), seg.body().len());
-        assert_eq!(seg.status(), 200);
-        assert!(seg.body().len() > 1000);
+
+        let master = handle("/hls", &format!("u={}", enc(&url)), LOCAL_ORIGIN).await;
+        assert_eq!(master.status(), 200, "master playlist HTTP status");
+        let master_text = std::str::from_utf8(master.body()).expect("master playlist UTF-8");
+        assert!(master_text.starts_with("#EXTM3U"), "master playlist signature");
+
+        let mut child_playlist: Option<String> = None;
+        let mut encryption_key: Option<String> = None;
+        let mut media_segment: Option<String> = None;
+        collect_live_hls_resources(master_text, &mut child_playlist, &mut encryption_key, &mut media_segment);
+
+        let mut child_verified = false;
+        if let Some(target) = child_playlist {
+            let child = handle("/seg", &format!("u={}", enc(&target)), LOCAL_ORIGIN).await;
+            assert_eq!(child.status(), 200, "child playlist HTTP status");
+            let child_text = std::str::from_utf8(child.body()).expect("child playlist UTF-8");
+            assert!(child_text.starts_with("#EXTM3U"), "child playlist signature");
+            collect_live_hls_resources(child_text, &mut None, &mut encryption_key, &mut media_segment);
+            child_verified = true;
+        }
+
+        let mut key_verified = false;
+        if let Some(target) = encryption_key {
+            let key = handle("/seg", &format!("u={}", enc(&target)), LOCAL_ORIGIN).await;
+            assert_eq!(key.status(), 200, "AES key HTTP status");
+            assert_eq!(key.body().len(), 16, "AES-128 key must be 16 bytes");
+            key_verified = true;
+        }
+
+        let segment_target = media_segment.expect("playlist contains a media segment");
+        let segment = handle("/seg", &format!("u={}", enc(&segment_target)), LOCAL_ORIGIN).await;
+        assert_eq!(segment.status(), 200, "media segment HTTP status");
+        assert!(segment.body().len() > 1000, "media segment body is unexpectedly small");
+        println!(
+            "live_media_acceptance master=PASS child={} key={} segment=PASS segment_bytes={}",
+            if child_verified { "PASS" } else { "NOT_PRESENT" },
+            if key_verified { "PASS" } else { "NOT_PRESENT" },
+            segment.body().len()
+        );
     }
 
     /// 离线回归：不再依赖带 auth_key 时效的真实上游地址（旧地址已过期，会 403）。

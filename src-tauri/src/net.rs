@@ -215,7 +215,15 @@ pub async fn get(
         for hop in 0..=5 {
             let resolving = Instant::now();
             let (target, http) = client_for(next.as_str()).await.map_err(|e| policy_error("dns_or_client", e))?;
-            crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
+            crate::playback_log::record("network.target_ready", json!({
+                "resource": crate::playback_log::resource_id(raw),
+                "target_resource": crate::playback_log::resource_id(target.as_str()),
+                "host": target.host_str(),
+                "scheme": target.scheme(),
+                "port": target.port_or_known_default(),
+                "dns_or_client_ms": resolving.elapsed().as_millis() as u64,
+                "hop": hop
+            }));
             let mut request = http.get(target.clone()).timeout(timeout);
             if let Some(value) = accept {
                 request = request.header("Accept", value);
@@ -223,7 +231,22 @@ pub async fn get(
             if let Some(value) = referer {
                 request = request.header("Referer", value);
             }
-            let response = request.send().await.map_err(|e| err_text(&e))?;
+            let response = request.send().await.map_err(|e| {
+                crate::playback_log::record(
+                    "network.transport_failed",
+                    json!({
+                        "host": target.host_str(),
+                        "scheme": target.scheme(),
+                        "port": target.port_or_known_default(),
+                        "phase": "send",
+                        "error_kind": transport_error_kind(&e),
+                        "is_timeout": e.is_timeout(),
+                        "is_connect": e.is_connect(),
+                        "is_request": e.is_request(),
+                    }),
+                );
+                err_text(&e)
+            })?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
             }
@@ -311,6 +334,40 @@ pub fn err_text(e: &reqwest::Error) -> String {
     out
 }
 
+/// 将 reqwest 传输失败映射为不含 URL、证书正文或代理凭据的稳定诊断类别。
+pub fn transport_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        return "timeout";
+    }
+    if e.is_connect() {
+        let chain = err_text(e).to_ascii_lowercase();
+        if chain.contains("dns") || chain.contains("name or service not known") {
+            "dns_error"
+        } else if chain.contains("certificate")
+            || chain.contains("tls")
+            || chain.contains("handshake")
+        {
+            "tls_error"
+        } else if chain.contains("proxy") || chain.contains("tunnel") {
+            "proxy_error"
+        } else if chain.contains("refused") {
+            "connection_refused"
+        } else {
+            "connect_error"
+        }
+    } else if e.is_body() {
+        "body_error"
+    } else if e.is_decode() {
+        "decode_error"
+    } else if e.is_redirect() {
+        "redirect_error"
+    } else if e.is_request() {
+        "request_error"
+    } else {
+        "transport_error"
+    }
+}
+
 fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
     let mut ips: Vec<_> = addrs.into_iter().map(|addr| addr.ip()).collect();
     ips.sort_unstable();
@@ -327,6 +384,39 @@ fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
     });
     json!({ "count": ips.len(), "has_fake_ip": has_fake_ip })
 }
+
+/// 只读取 Windows 当前用户 Internet Settings 的代理开关，不读取或输出代理地址/PAC URL。
+#[cfg(windows)]
+fn windows_proxy_diagnostics() -> Value {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let settings = match hkcu.open_subkey(path) {
+        Ok(key) => key,
+        Err(_) => return json!({"registry_readable": false}),
+    };
+    let proxy_enable = settings.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
+    let fixed_proxy_configured = settings.get_value::<String, _>("ProxyServer").is_ok_and(|v| !v.trim().is_empty());
+    let pac_configured = settings.get_value::<String, _>("AutoConfigURL").is_ok_and(|v| !v.trim().is_empty());
+    let auto_detect = settings.get_value::<u32, _>("AutoDetect").unwrap_or(0) != 0;
+    // WinINet connection blob 的 flags 字节：0x08 表示自动检测（WPAD）。仅提取该位。
+    let connections = hkcu.open_subkey(format!(r"{path}\Connections")).ok();
+    let connection_wpad = connections
+        .and_then(|key| key.get_raw_value("DefaultConnectionSettings").ok())
+        .and_then(|value| value.bytes.get(8).copied())
+        .is_some_and(|flags| flags & 0x08 != 0);
+    json!({
+        "registry_readable": true,
+        "fixed_proxy_enabled": proxy_enable,
+        "fixed_proxy_configured": fixed_proxy_configured,
+        "pac_configured": pac_configured,
+        "wpad_enabled": auto_detect || connection_wpad,
+    })
+}
+
+#[cfg(not(windows))]
+fn windows_proxy_diagnostics() -> Value { json!({"supported": false}) }
 
 /// 网络自检：DNS / HTTP / 代理相关环境变量，用于远程定位「打不开」。
 pub async fn diagnose() -> Value {
@@ -364,6 +454,7 @@ pub async fn diagnose() -> Value {
 
     json!({
         "base": cur,
+        "windows_proxy": windows_proxy_diagnostics(),
         "host": host,
         "dns": dns,
         "http": http,
@@ -618,6 +709,10 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
+    let target = url::Url::parse(url).ok();
+    let host = target.as_ref().and_then(|u| u.host_str()).map(str::to_owned);
+    let scheme = target.as_ref().map(|u| u.scheme().to_string());
+    let port = target.as_ref().and_then(|u| u.port_or_known_default());
     let mut attempt = 0;
     let url = url.to_string();
     let referer = format!("{}/", base());
@@ -627,9 +722,19 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         let resource = resource.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let host = host.clone();
+        let scheme = scheme.clone();
+        let port = port;
         async move {
             let started = Instant::now();
-            crate::playback_log::record("network.begin", json!({"request": request, "resource": resource, "attempt": attempt}));
+            crate::playback_log::record("network.begin", json!({
+                "request": request,
+                "resource": resource,
+                "attempt": attempt,
+                "host": host,
+                "scheme": scheme,
+                "port": port
+            }));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
@@ -644,10 +749,37 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
+                let bytes = resp.bytes().await.map_err(|e| {
+                    crate::playback_log::record(
+                        "network.transport_failed",
+                        json!({
+                            "host": host,
+                            "scheme": scheme,
+                            "port": port,
+                            "phase": "body",
+                            "error_kind": transport_error_kind(&e),
+                            "is_timeout": e.is_timeout(),
+                            "is_connect": e.is_connect(),
+                            "is_body": e.is_body(),
+                        }),
+                    );
+                    err_text(&e)
+                })?.to_vec();
                 Ok((ctype, bytes))
             }.await;
-            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
+            crate::playback_log::record("network.end", json!({
+                "request": request,
+                "resource": resource,
+                "attempt": attempt,
+                "host": host,
+                "scheme": scheme,
+                "port": port,
+                "status": status,
+                "headers_ms": headers_ms,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+                "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))
+            }));
             result
         }
     })
