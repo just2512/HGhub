@@ -142,6 +142,15 @@ impl ClientProxy {
             Self::Proxy(proxy) => format!("proxy:{proxy}"),
         }
     }
+
+    /// 日志只记录代理使用模式，不记录地址、用户名或认证信息。
+    fn diagnostic_mode(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Direct => "direct",
+            Self::Proxy(_) => "proxy",
+        }
+    }
 }
 
 /// 每次按完整目标 URL 解析 PAC，再按实际代理结果复用连接池。
@@ -258,6 +267,22 @@ fn configured_proxy(
         ProxyChoice::Proxy(proxy) => Ok(Some(proxy)),
         ProxyChoice::NoMatch => Err("Windows 固定代理未配置当前 URL 协议"),
     }
+}
+
+/// PAC/WPAD 均未启用时，优先使用 WinHttpGetIEProxyConfigForCurrentUser
+/// 返回的固定代理；无固定代理配置时才交给 reqwest 的 system-proxy。
+/// 返回 None 表示没有可显式采用的固定代理，Some(None) 表示明确 DIRECT。
+fn fixed_proxy_decision(
+    proxy_list: &str,
+    bypass_list: &str,
+    target: &url::Url,
+) -> Result<Option<Option<String>>, String> {
+    if proxy_list.trim().is_empty() {
+        return Ok(None);
+    }
+    configured_proxy(proxy_list, bypass_list, target)
+        .map(Some)
+        .map_err(|message| message.to_string())
 }
 
 /// PAC 下载/发现失败时使用静态配置；静态代理即使因 bypass 或 DIRECT 得到 None，
@@ -402,7 +427,9 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     let fixed_proxy = unsafe { take_wide(config.proxy) }.unwrap_or_default();
     let fixed_bypass = unsafe { take_wide(config.proxy_bypass) }.unwrap_or_default();
     if pac_url.is_none() && config.auto_detect == 0 {
-        return Ok(None);
+        // 用户明确启用了 Windows 固定代理时，不能退回未经验证的
+        // reqwest System 模式；直接采用 WinINet 当前用户返回的 proxy/bypass。
+        return fixed_proxy_decision(&fixed_proxy, &fixed_bypass, target);
     }
 
     let agent = wide(UA);
@@ -565,6 +592,11 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
 
     // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
     let proxy_mode = proxy_for_target(&target).await?;
+    crate::playback_log::record("network.proxy_selected", json!({
+        "host": host,
+        "scheme": target.scheme(),
+        "mode": proxy_mode.diagnostic_mode()
+    }));
     // DNS 重新校验后若地址集合变化，不得复用仍在 TTL 边界内的旧固定地址客户端。
     let address_key = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
     let key = format!("{dns_key}:{address_key}:{}", proxy_mode.cache_fragment());
@@ -1450,6 +1482,29 @@ mod tests {
             None
         );
         assert!(configured_proxy("http=proxy-http:8080", "", &https).is_err());
+    }
+
+    #[test]
+    fn fixed_proxy_is_selected_when_pac_and_wpad_are_disabled() {
+        let target = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+
+        assert_eq!(
+            fixed_proxy_decision(
+                "http=proxy-http:8080;https=127.0.0.1:7890",
+                "",
+                &target
+            ).unwrap(),
+            Some(Some("http://127.0.0.1:7890".into()))
+        );
+        assert_eq!(
+            fixed_proxy_decision(
+                "127.0.0.1:7890",
+                "media.example.net",
+                &target
+            ).unwrap(),
+            Some(None)
+        );
+        assert_eq!(fixed_proxy_decision("", "", &target).unwrap(), None);
     }
 
     #[test]
