@@ -415,17 +415,22 @@ mod tests {
         media_segment: &mut Option<String>,
     ) {
         for line in text.lines() {
-            if line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:") {
-                if let Some((_, attrs)) = hls_attributes(line) {
+            if line.starts_with('#') {
+                if let Some((tag, attrs)) = hls_attributes(line) {
                     if let Some(value) = attrs.iter().find_map(|attr| attr.trim().strip_prefix("URI=").map(str::trim)) {
                         if let Ok(parsed) = url::Url::parse(value.trim_matches('"')) {
                             if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
-                                *encryption_key = Some(target);
+                                let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
+                                if tag == "#EXT-X-KEY" || tag == "#EXT-X-SESSION-KEY" {
+                                    *encryption_key = Some(target);
+                                } else if path.ends_with(".m3u8") && child_playlist.is_none() {
+                                    *child_playlist = Some(target);
+                                }
                             }
                         }
                     }
                 }
-            } else if !line.starts_with('#') && !line.trim().is_empty() {
+            } else if !line.trim().is_empty() {
                 if let Ok(parsed) = url::Url::parse(line.trim()) {
                     if let Some(target) = parsed.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()) {
                         let path = url::Url::parse(&target).ok().map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
@@ -439,7 +444,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
