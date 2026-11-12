@@ -1,0 +1,69 @@
+name: Publish Find N2 Test APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful Actions run containing the Android test APK artifact
+        required: true
+        default: "43179564974"
+        type: string
+      release_tag:
+        description: Release tag (non-v* so the full multi-platform release workflow is not triggered)
+        required: true
+        default: "find-n2-test-2026-11-12"
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-find-n2-test.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish existing remote-built APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK artifact from the original Actions run
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          repo: ${{ github.repository }}
+          run_id: ${{ inputs.source_run_id || '43179564974' }}
+          name: hghub-find-n2-arm64-test-apk
+          path: artifacts
+          if_no_artifact_found: fail
+
+      - name: Validate and prepare release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find artifacts -type f -name '*.apk' -print)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one APK, found ${#apks[@]}"
+            find artifacts -maxdepth 4 -type f -print
+            exit 1
+          fi
+          cp "${apks[0]}" HGhub-FindN2-test.apk
+          sha256sum HGhub-FindN2-test.apk
+          ls -lh HGhub-FindN2-test.apk
+
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || 'find-n2-test-2026-11-12' }}
+          name: HGhub Find N2 Test Build (2026-11-12)
+          body: |
+            Find N2 foldable-screen and media playback test APK.
+
+            Source: GitHub Actions run 43179564974
+            Source commit: 731e1eeef5c1a5ebcd7a4cd832cdd7bde2cefa2e
+
+            This is a test build. Fold/unfold behavior, playback continuity, HLS decoding and background recovery still require physical-device acceptance.
+          prerelease: true
+          make_latest: false
+          files: HGhub-FindN2-test.apk
+          fail_on_unmatched_files: true
