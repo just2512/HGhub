@@ -130,6 +130,35 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const playKey = `${curId}:${curEp}`;
   const playUrl = playUrls[playKey] || "";
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
+
+  // 折叠屏展开/合上只改变容器尺寸；记录变化但不销毁 video/HLS 实例。
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el) return undefined;
+    let previous = "";
+    const report = () => {
+      const rect = el.getBoundingClientRect();
+      const key = `${Math.round(rect.width)}x${Math.round(rect.height)}`;
+      if (key === previous) return;
+      previous = key;
+      videoRef.current?.trace("viewport.resize", {
+        width: Math.round(rect.width), height: Math.round(rect.height),
+        window_width: window.innerWidth, window_height: window.innerHeight,
+        orientation: window.innerWidth > window.innerHeight ? "landscape" : "portrait",
+        video_id: curId, episode: curEp,
+      });
+    };
+    const observer = new ResizeObserver(report);
+    observer.observe(el);
+    window.addEventListener("orientationchange", report);
+    window.visualViewport?.addEventListener("resize", report);
+    report();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("orientationchange", report);
+      window.visualViewport?.removeEventListener("resize", report);
+    };
+  }, [curId, curEp]);
   const episodes = detail?.episodes || [];
   const post = posts[curId];
 

@@ -556,3 +556,10 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
 .hg-tabbar button:focus-visible,
 .hg-player-ui button:focus,
 .hg-player-ui button:focus-visible { outline: none; }
+
+
+/* Find N2 / Android foldable viewport: keep layout constrained to the live WebView viewport. */
+.plat-android { min-width: 0; min-height: 0; height: 100%; overscroll-behavior: none; }
+.plat-android .win-main, .plat-android .player-root, .plat-android .player-surface { min-width: 0; min-height: 0; }
+.plat-android [data-layout="compact"] .desktop-dock-panel.is-open { width: min(88vw, 372px); }
+.plat-android .fs-immersive { height: 100dvh; height: var(--app-viewport-height, 100dvh); }

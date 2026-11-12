@@ -464,23 +464,50 @@ mod tests {
         assert!(bom.body().starts_with(b"#EXTM3U\n"));
     }
 
-    /// 联网测试：默认跳过，手动跑 `cargo test --lib -- --ignored`。
-    /// 依赖上游 `/api/videos/117/play` 返回的实时播放地址。
+    /// 真实上游验收：默认跳过；可指定 source/video/episode，否则从实时首页选择可播放条目。
+    /// 验证 Edge V1 播放 API、Rust m3u8 代理、KEY/分片代理和真实分片字节。
     #[tokio::test]
-    #[ignore = "联网测试：依赖上游实时播放地址，手动用 --ignored 运行"]
+    #[ignore = "联网验收：请求真实上游 API/CDN，手动用 --ignored 运行"]
     async fn live_play_chain() {
-        use crate::net::edge;
-        let play = edge(
-            &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
-            None,
-        )
-        .await
-        .expect("play api");
+        use crate::net::{edge, set_base};
+        let origin = std::env::var("HGHUB_TEST_SOURCE").unwrap_or_else(|_| crate::net::base());
+        set_base(&origin).expect("valid HTTPS source");
+        let requested_id = std::env::var("HGHUB_TEST_VIDEO_ID").ok().and_then(|v| v.parse::<u64>().ok());
+        let requested_episode = std::env::var("HGHUB_TEST_EPISODE").ok().and_then(|v| v.parse::<u32>().ok());
+        let (video_id, episode) = if let Some(id) = requested_id {
+            let detail = edge(&origin, "GET", &format!("/api/videos/{id}"), None, None).await.expect("video detail API");
+            let ep = requested_episode.or_else(|| detail["episodes"].as_array().and_then(|items| items.first()).and_then(|item| item["ep_num"].as_u64()).map(|n| n as u32)).expect("video must expose a playable episode");
+            (id, ep)
+        } else {
+            let feed = edge(&origin, "GET", "/api/videos?page=1&size=20", None, None).await.expect("video feed API");
+            let items = feed["items"].as_array().expect("feed items array");
+            let mut selected = None;
+            for item in items.iter().take(20) {
+                let id = item["id"].as_u64().or_else(|| item["id"].as_i64().map(|n| n as u64));
+                let Some(id) = id else { continue };
+                if let Ok(detail) = edge(&origin, "GET", &format!("/api/videos/{id}"), None, None).await {
+                    let ep = requested_episode.or_else(|| detail["episodes"].as_array().and_then(|items| items.first()).and_then(|item| item["ep_num"].as_u64()).map(|n| n as u32));
+                    if let Some(ep) = ep { selected = Some((id, ep)); break; }
+                }
+            }
+            selected.expect("live feed has no video with a playable episode")
+        };
+        println!("selected public video={video_id} episode={episode}");
+        let path = format!("/api/videos/{video_id}/episodes/{episode}/playback");
+        let primary = edge(&origin, "POST", &path, Some(serde_json::json!({})), None).await;
+        let play = match primary {
+            Ok(mut value) => {
+                if value.get("video_url").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty()) {
+                    let main = value.get("streams").and_then(|v| v.get("main")).and_then(|v| v.as_str()).map(str::to_owned);
+                    if let Some(main) = main { value["video_url"] = serde_json::json!(main); }
+                }
+                if value.get("video_url").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) { value }
+                else { edge(&origin, "GET", &format!("/api/videos/{video_id}/play?ep={episode}&page_texts=0"), None, None).await.expect("legacy playback api") }
+            }
+            Err(_) => edge(&origin, "GET", &format!("/api/videos/{video_id}/play?ep={episode}&page_texts=0"), None, None).await.expect("legacy playback api"),
+        };
         let url = play["video_url"].as_str().expect("video_url").to_string();
-        println!("play url: {}", &url[..url.len().min(90)]);
+        println!("play resource: {}", crate::playback_log::resource_id(&url));
         let (_, bytes) = fetch_bytes(&url).await.expect("fetch playlist");
         let text = String::from_utf8_lossy(&bytes);
         println!(
@@ -505,6 +532,16 @@ mod tests {
         println!("segment status={} len={}", seg.status(), seg.body().len());
         assert_eq!(seg.status(), 200);
         assert!(seg.body().len() > 1000);
+        if let Some(key_line) = body.lines().find(|line| line.starts_with("#EXT-X-KEY")) {
+            if let Some(key_uri) = key_line.split("URI=\"").nth(1).and_then(|tail| tail.split('\"').next()) {
+                assert!(key_uri.starts_with(&format!("{LOCAL_ORIGIN}/seg?u=")), "HLS key escaped local proxy");
+                let key_query = key_uri.split_once('?').map(|(_, query)| query).expect("rewritten key query");
+                let key = handle("/seg", key_query, LOCAL_ORIGIN).await;
+                println!("key status={} len={}", key.status(), key.body().len());
+                assert_eq!(key.status(), 200);
+                assert_eq!(key.body().len(), 16, "AES-128 HLS key must be 16 bytes");
+            }
+        }
     }
 
     /// 离线回归：不再依赖带 auth_key 时效的真实上游地址（旧地址已过期，会 403）。

@@ -41,6 +41,9 @@ export default function LinePicker({ open, onClose }: { open: boolean; onClose: 
   const [probes, setProbes] = useState<ProbeMap>({});
   const [probing, setProbing] = useState("");
   const [switching, setSwitching] = useState("");
+  const [customName, setCustomName] = useState("");
+  const [customUrl, setCustomUrl] = useState("");
+  const [addingCustom, setAddingCustom] = useState(false);
 
   const readState = () => {
     api.lineState().then(setState).catch((e) => toast((e as Error).message || "读取线路失败", "info"));
@@ -100,11 +103,30 @@ export default function LinePicker({ open, onClose }: { open: boolean; onClose: 
     }
   };
 
+  const addCustom = async () => {
+    if (addingCustom || !customUrl.trim()) return;
+    setAddingCustom(true);
+    try {
+      const item = await api.lineAddCustom(customName, customUrl);
+      setState((s) => s ? { ...s, custom: [...(s.custom || []), item] } : s);
+      setCustomName(""); setCustomUrl("");
+      toast(`已验证并保存数据源：${hostOf(item.url)}`, "ok");
+    } catch (e) { toast((e as Error).message || "数据源验证失败", "info"); }
+    finally { setAddingCustom(false); }
+  };
+  const removeCustom = async (url: string) => {
+    try {
+      await api.lineRemoveCustom(url);
+      setState((s) => s ? { ...s, custom: (s.custom || []).filter((item) => item.url !== url) } : s);
+      toast("已删除自定义数据源", "ok");
+    } catch (e) { toast((e as Error).message || "删除失败", "info"); }
+  };
   const fixed = state?.fixed || [];
-  const busyAll = !!probing || !!switching;
+  const custom = state?.custom || [];
+  const busyAll = !!probing || !!switching || addingCustom;
 
   const body = (
-    <div className="flex flex-col min-h-0" style={{ maxHeight: isMobile ? "74vh" : "min(72vh, 620px)" }}>
+    <div className="flex flex-col min-h-0" style={{ maxHeight: isMobile ? "min(74dvh, 680px)" : "min(72vh, 620px)" }}>
       <div className="shrink-0 flex items-center gap-2 px-4 pt-3 pb-2">
         <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ISettings size={16} /></span>
         <div className="flex-1 min-w-0">
@@ -115,6 +137,29 @@ export default function LinePicker({ open, onClose }: { open: boolean; onClose: 
       </div>
 
       <div className="flex-1 scroll-y px-3 pb-4">
+        <div className="px-1 mt-1 mb-4">
+          <div className="text-[10.5px] font-semibold text-dim tracking-wide mb-1.5">添加自定义数据源</div>
+          <div className="rounded-(--r-md) bg-s2 p-3 space-y-2">
+            <input value={customName} onChange={(e) => setCustomName(e.target.value)} placeholder="名称（可选）" maxLength={40} autoCapitalize="none"
+              className="w-full h-9 rounded-(--r-sm) bg-s3 px-3 text-[12px] text-on outline-none placeholder:text-dim" />
+            <input value={customUrl} onChange={(e) => setCustomUrl(e.target.value)} placeholder="https://example.com" type="url" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+              className="w-full h-9 rounded-(--r-sm) bg-s3 px-3 text-[12px] text-on outline-none placeholder:text-dim" />
+            <button onClick={() => void addCustom()} disabled={busyAll || !customUrl.trim()} className="w-full h-9 rounded-(--r-sm) bg-primary text-on-primary text-[12px] font-semibold pressable disabled:opacity-50">
+              {addingCustom ? "正在验证 API…" : "验证 API 并保存"}
+            </button>
+            <div className="text-[10px] text-dim leading-relaxed">只接受公网 HTTPS 根地址。保存前会实际请求 Edge V1 视频列表 API；自定义线路仅允许游客访问，登录凭据不会发送给它。</div>
+          </div>
+        </div>
+        {custom.length > 0 && <>
+          <div className="flex items-center gap-2 px-1 mt-3 mb-1.5"><span className="text-[10.5px] font-semibold text-dim tracking-wide">自定义数据源</span><span className="text-[10px] text-dim">{custom.length} 条</span></div>
+          <div className="rounded-(--r-md) bg-s2 divide-y divide-s3 overflow-hidden">
+            {custom.map((item) => <div key={item.url} className="flex items-center gap-2 pr-2">
+              <div className="flex-1 min-w-0"><Row item={item} current={state?.base === item.url} probe={probes[item.url]} busy={probing === item.url} disabled={busyAll} onPick={pick} onProbe={(u) => probe([{ url: u }], u)} /></div>
+              <button onClick={() => void removeCustom(item.url)} disabled={busyAll || state?.base === item.url} title={state?.base === item.url ? "请先切换线路再删除" : "删除数据源"} className="shrink-0 px-2 py-2 text-[10.5px] text-danger pressable disabled:opacity-35">删除</button>
+            </div>)}
+          </div>
+        </>}
+
         <div className="flex items-center gap-2 px-1 mt-1 mb-1.5">
           <span className="text-[10.5px] font-semibold text-dim tracking-wide">固定线路</span>
           <span className="text-[10px] text-dim">需代理 / 非大陆网络</span>

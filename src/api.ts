@@ -111,6 +111,8 @@ export const api = {
   lineSet: (url: string) => call<string>("line_set", { url }),
   lineMirrors: () => call<LineMirrors>("line_mirrors"),
   lineProbe: (urls: string[]) => call<LineProbe[]>("line_probe", { urls }),
+  lineAddCustom: (name: string, url: string) => call<LineItem>("line_add_custom", { name, url }),
+  lineRemoveCustom: (url: string) => call<void>("line_remove_custom", { url }),
 
   /* 更新检查：对比 GitHub Release 的 tag */
   checkUpdate: () => call<UpdateInfo>("check_update"),
@@ -133,7 +135,7 @@ export type UpdateInfo = {
 /* ── 线路（数据源） ─────────────────────────────────────── */
 
 export type LineItem = { name?: string; url: string; host?: string };
-export type LineState = { base: string; default: string; fixed: LineItem[] };
+export type LineState = { base: string; default: string; fixed: LineItem[]; custom?: LineItem[] };
 export type LineMirrors = { source: string; script?: string; items: LineItem[] };
 export type LineProbe = { url: string; ok: boolean; status?: number; ms: number; error?: string };
 

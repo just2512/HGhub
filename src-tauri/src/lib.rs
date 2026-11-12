@@ -8,6 +8,7 @@ mod net;
 mod network_policy;
 mod playback_log;
 mod session;
+mod sources;
 
 use api::Api;
 use tauri::Manager;
@@ -57,6 +58,7 @@ pub fn run() {
                 let _ = std::fs::create_dir_all(&dir);
                 // 上次选择的线路（设置 → 线路）在启动时恢复
                 net::bind_base(&dir);
+                sources::bind(&dir);
                 playback_log::bind(&dir);
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
@@ -143,6 +145,8 @@ pub fn run() {
             api::line_set,
             api::line_mirrors,
             api::line_probe,
+            api::line_add_custom,
+            api::line_remove_custom,
             api::check_update,
             api::open_url,
             api::set_orientation,
