@@ -120,6 +120,96 @@ fn proxy_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyChoice {
+    Direct,
+    Proxy(String),
+    NoMatch,
+}
+
+/// 解析 WinHTTP 返回的代理列表，并按目标协议选取对应项。
+fn choose_proxy(raw: &str, scheme: &str) -> ProxyChoice {
+    let mut default_proxy = None;
+    for entry in raw.split([';', ' ', '\t']).map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some((protocol, value)) = entry.split_once('=') {
+            if protocol.trim().eq_ignore_ascii_case(scheme) {
+                return proxy_choice(value);
+            }
+        } else if default_proxy.is_none() {
+            default_proxy = Some(entry);
+        }
+    }
+    default_proxy.map(proxy_choice).unwrap_or(ProxyChoice::NoMatch)
+}
+
+fn proxy_choice(raw: &str) -> ProxyChoice {
+    let selected = raw.trim();
+    if selected.is_empty() {
+        return ProxyChoice::NoMatch;
+    }
+    if selected.eq_ignore_ascii_case("DIRECT") {
+        return ProxyChoice::Direct;
+    }
+    let url = if selected.contains("://") {
+        selected.to_string()
+    } else {
+        format!("http://{selected}")
+    };
+    ProxyChoice::Proxy(url)
+}
+
+/// Windows 代理绕过规则：支持精确主机、*.domain、.domain、host:port 和 <local>。
+fn bypasses_host(list: &str, target: &url::Url) -> bool {
+    let Some(host) = target.host_str() else { return false };
+    let host_lower = host.to_ascii_lowercase();
+    list.split([';', ',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .any(|raw_rule| {
+            if raw_rule.eq_ignore_ascii_case("<local>") {
+                return host.parse::<std::net::IpAddr>().is_err() && !host.contains('.');
+            }
+
+            let rule = if raw_rule.starts_with('[') {
+                raw_rule
+                    .find(']')
+                    .map(|end| &raw_rule[1..end])
+                    .unwrap_or(raw_rule)
+            } else if raw_rule.matches(':').count() == 1 {
+                raw_rule.split(':').next().unwrap_or(raw_rule)
+            } else {
+                raw_rule
+            };
+            let wildcard = rule.starts_with("*.");
+            let suffix = rule.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+            if wildcard || raw_rule.starts_with('.') {
+                host_lower == suffix || host_lower.ends_with(&format!(".{suffix}"))
+            } else {
+                host_lower == suffix
+            }
+        })
+}
+
+/// 将用户配置中的固定代理作为 PAC/WPAD 无法取得结果时的回退。
+/// 静态绕过规则和代理设置来自同一份当前用户配置。
+fn configured_proxy(
+    proxy_list: &str,
+    bypass_list: &str,
+    target: &url::Url,
+) -> Result<Option<String>, &'static str> {
+    if bypasses_host(bypass_list, target) {
+        return Ok(None);
+    }
+    if proxy_list.trim().is_empty() {
+        return Ok(None);
+    }
+    match choose_proxy(proxy_list, target.scheme()) {
+        ProxyChoice::Direct => Ok(None),
+        ProxyChoice::Proxy(proxy) => Ok(Some(proxy)),
+        ProxyChoice::NoMatch => Err("Windows 固定代理未配置当前 URL 协议"),
+    }
+}
+
 /// 按目标 URL 新建客户端。Windows PAC/WPAD 必须先经 WinHTTP 解析，
 /// 因为 reqwest 的 system-proxy 只读取固定代理，不执行浏览器的 PAC 脚本。
 fn build_client(target: &url::Url, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
@@ -234,40 +324,6 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         GlobalFree(value.cast());
         Some(result)
     }
-    fn bypasses_host(list: &str, target: &url::Url) -> bool {
-        let Some(host) = target.host_str() else { return false };
-        list.split([';', ',']).map(str::trim).filter(|v| !v.is_empty()).any(|rule| {
-            if rule.eq_ignore_ascii_case("<local>") {
-                return !host.contains('.');
-            }
-            let rule = rule.split(':').next().unwrap_or(rule).trim_start_matches('.');
-            if let Some(suffix) = rule.strip_prefix("*.") {
-                host.eq_ignore_ascii_case(suffix)
-                    || host.to_ascii_lowercase().ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
-            } else {
-                host.eq_ignore_ascii_case(rule)
-            }
-        })
-    }
-    fn choose_proxy(raw: &str, scheme: &str) -> Option<String> {
-        let selected = raw.split(';').map(str::trim).filter(|v| !v.is_empty()).find_map(|entry| {
-            if let Some((protocol, value)) = entry.split_once('=') {
-                protocol.trim().eq_ignore_ascii_case(scheme).then(|| value.trim())
-            } else {
-                Some(entry)
-            }
-        })?;
-        if selected.eq_ignore_ascii_case("DIRECT") || selected.is_empty() {
-            return None;
-        }
-        let selected = selected.split(';').next().unwrap_or(selected).trim();
-        if selected.contains("://") {
-            Some(selected.to_string())
-        } else {
-            Some(format!("http://{selected}"))
-        }
-    }
-
     let mut config = IeProxyConfig {
         auto_detect: 0,
         auto_config_url: null_mut(),
@@ -279,8 +335,8 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         return Ok(None);
     }
     let pac_url = unsafe { take_wide(config.auto_config_url) };
-    let _fixed_proxy = unsafe { take_wide(config.proxy) };
-    let _fixed_bypass = unsafe { take_wide(config.proxy_bypass) };
+    let fixed_proxy = unsafe { take_wide(config.proxy) }.unwrap_or_default();
+    let fixed_bypass = unsafe { take_wide(config.proxy_bypass) }.unwrap_or_default();
     if pac_url.is_none() && config.auto_detect == 0 {
         return Ok(None);
     }
@@ -299,13 +355,17 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         return Err("Windows PAC 解析器初始化失败".into());
     }
     let target_wide = wide(target.as_str());
+    // 当前用户可能同时启用了 PAC URL 和自动检测；保留两种已配置的发现方式。
+    let mut flags = 0;
+    if pac_url.is_some() {
+        flags |= WINHTTP_AUTOPROXY_CONFIG_URL;
+    }
+    if config.auto_detect != 0 {
+        flags |= WINHTTP_AUTOPROXY_AUTO_DETECT;
+    }
     let mut options = AutoProxyOptions {
-        flags: if pac_url.is_some() {
-            WINHTTP_AUTOPROXY_CONFIG_URL
-        } else {
-            WINHTTP_AUTOPROXY_AUTO_DETECT
-        },
-        auto_detect_flags: if pac_url.is_none() {
+        flags,
+        auto_detect_flags: if config.auto_detect != 0 {
             WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
         } else {
             0
@@ -328,24 +388,23 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     };
     unsafe { WinHttpCloseHandle(session); }
     if !resolved {
-        if pac_url.is_none() {
-            // WPAD 自动发现未找到 PAC 时，Windows 的常见语义是回退 DIRECT；
-            // 显式 PAC URL 解析失败则不能静默绕过企业代理。
-            return Ok(Some(None));
+        // WinHTTP 无法取得 PAC/WPAD 结果时，先使用用户显式配置的静态代理及绕过名单。
+        // 若没有静态代理且配置了显式 PAC URL，则 fail closed，不能静默绕过代理策略。
+        let fallback = configured_proxy(&fixed_proxy, &fixed_bypass, target)
+            .map_err(|message| message.to_string())?;
+        if fallback.is_some() || pac_url.is_none() {
+            return Ok(Some(fallback));
         }
         return Err("Windows PAC 代理解析失败；为避免绕过显式代理策略，媒体请求已阻止".into());
     }
     let proxy = unsafe { take_wide(info.proxy) }.unwrap_or_default();
     let bypass = unsafe { take_wide(info.proxy_bypass) }.unwrap_or_default();
-    let direct = info.access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY
-        || bypasses_host(&bypass, target);
-    if direct {
-        Ok(Some(None))
-    } else {
-        let chosen = choose_proxy(&proxy, target.scheme())
-            .ok_or("Windows PAC 未返回适用于当前协议的代理")?;
-        Ok(Some(Some(chosen)))
+    if info.access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY {
+        return Ok(Some(None));
     }
+    configured_proxy(&proxy, &bypass, target)
+        .map(Some)
+        .map_err(|message| message.to_string())
 }
 
 #[cfg(not(windows))]
@@ -994,6 +1053,63 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_selection_respects_target_scheme_and_direct_decisions() {
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080;https=proxy-https:8443", "https"),
+            ProxyChoice::Proxy("http://proxy-https:8443".into())
+        );
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080;https=proxy-https:8443", "http"),
+            ProxyChoice::Proxy("http://proxy-http:8080".into())
+        );
+        assert_eq!(
+            choose_proxy("https://proxy.example:9443", "https"),
+            ProxyChoice::Proxy("https://proxy.example:9443".into())
+        );
+        assert_eq!(choose_proxy("DIRECT", "https"), ProxyChoice::Direct);
+        assert_eq!(
+            choose_proxy("http=proxy-http:8080", "https"),
+            ProxyChoice::NoMatch
+        );
+    }
+
+    #[test]
+    fn static_proxy_fallback_honors_bypass_and_fails_closed_on_scheme_mismatch() {
+        let https = url::Url::parse("https://media.example.net/playlist.m3u8").unwrap();
+        assert_eq!(
+            configured_proxy("http=proxy-http:8080;https=proxy-https:8443", "", &https).unwrap(),
+            Some("http://proxy-https:8443".into())
+        );
+        assert_eq!(
+            configured_proxy("proxy.example:8080", "media.example.net", &https).unwrap(),
+            None
+        );
+        assert_eq!(
+            configured_proxy("", "<local>", &url::Url::parse("http://printer/").unwrap()).unwrap(),
+            None
+        );
+        assert!(configured_proxy("http=proxy-http:8080", "", &https).is_err());
+    }
+
+    #[test]
+    fn proxy_bypass_matches_domains_ports_and_local_hosts_without_misclassifying_ip() {
+        let urls = [
+            ("https://example.com/", "*.example.com", true),
+            ("https://cdn.example.com/", "*.example.com", true),
+            ("https://notexample.com/", "*.example.com", false),
+            ("https://example.com:8443/", "example.com:443", true),
+            ("http://printer/", "<local>", true),
+            ("http://192.168.1.5/", "<local>", false),
+            ("http://[::1]/", "<local>", false),
+            ("http://[2001:db8::1]/", "[2001:db8::1]", true),
+        ];
+        for (raw_url, bypass, expected) in urls {
+            let target = url::Url::parse(raw_url).unwrap();
+            assert_eq!(bypasses_host(bypass, &target), expected, "{raw_url} / {bypass}");
+        }
+    }
 
     #[tokio::test]
     async fn terminal_errors_do_not_retry_but_transient_failures_can_recover() {
