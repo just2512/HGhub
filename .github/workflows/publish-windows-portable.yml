@@ -1,0 +1,117 @@
+name: Publish Windows Portable Release
+
+on:
+  push:
+    branches:
+      - fix/windows-pac-proxy-resolution
+    paths:
+      - ".github/workflows/publish-windows-portable.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hghub-windows-portable-release
+  cancel-in-progress: false
+
+jobs:
+  windows-portable:
+    name: Windows x64 portable release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $config = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+          "version=$($config.version)" >> $env:GITHUB_OUTPUT
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Run live HLS resource acceptance
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib media::tests::live_play_chain -- --ignored --nocapture
+
+      - name: Build Windows executable without installer or bundle
+        run: pnpm tauri build --no-bundle
+
+      - name: Package portable ZIP and checksum
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $exe = "src-tauri/target/release/huangguo-client.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Portable executable was not generated: $exe"
+          }
+          if ((Get-Item $exe).Length -le 0) {
+            throw "Portable executable is empty"
+          }
+
+          New-Item -ItemType Directory -Force "release/portable" | Out-Null
+          Copy-Item $exe "release/portable/HGhub.exe"
+          @"
+          HGhub $version - Windows x64 Portable
+
+          Usage:
+          1. Extract this ZIP to any writable folder.
+          2. Run HGhub.exe. No HGhub installer is required.
+
+          Requirement:
+          - Windows 10/11 x64
+          - Microsoft Edge WebView2 Runtime
+
+          Application data is stored in the current Windows user's application-data
+          directory; the executable itself can be launched from the extracted folder.
+          "@ | Set-Content "release/portable/README.txt" -Encoding UTF8
+
+          $zip = "release/HGhub_{0}_windows_x64_portable.zip" -f $version
+          Compress-Archive -Path "release/portable/*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "SHA256  $(Split-Path $zip -Leaf)  $hash" | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
+
+          Get-Item $exe, $zip, "release/SHA256SUMS.txt" | Select-Object FullName, Length
+          Write-Output "PORTABLE_ZIP=$zip"
+          Write-Output "PORTABLE_SHA256=$hash"
+
+      - name: Publish Windows x64 portable Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-portable-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: HGhub v${{ steps.version.outputs.version }} Windows x64 便携版
+          body: |
+            Windows x64 免安装便携版。
+
+            - 下载并解压 ZIP，直接运行 HGhub.exe，不需要运行安装程序。
+            - 本 Release 不包含 NSIS、MSI 或其他安装包。
+            - 运行环境：Windows 10/11 x64，需有 Microsoft Edge WebView2 Runtime。
+            - 源码提交：${{ github.sha }}
+          prerelease: false
+          make_latest: false
+          files: |
+            release/HGhub_${{ steps.version.outputs.version }}_windows_x64_portable.zip
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
