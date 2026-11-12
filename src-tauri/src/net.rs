@@ -694,14 +694,22 @@ pub fn is_proxy_error(e: &str) -> bool {
 static LAST_HEAL: Lazy<std::sync::Mutex<Option<Instant>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
+/// 判断需要重建客户端的传输错误。reqwest/hyper 的错误链通常使用小写
+/// "tcp connect error"，因此必须先统一大小写，不能只匹配 "Connect"。
+fn should_heal_client(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("tunnel")
+        || reason.contains("proxy")
+        || reason.contains("connect")
+        || reason.contains("timed out")
+        || reason.contains("refused")
+        || reason.contains("dns")
+}
+
 /// 请求失败后按需重建客户端：代理隧道错误、连接被拒 / 超时都算「网络环境可能变了」。
 /// 3 秒内只重建一次，批量探测不会反复重建。
 pub fn heal_client(reason: &str) {
-    let connectish = reason.contains("Connect")
-        || reason.contains("timed out")
-        || reason.contains("refused")
-        || reason.contains("dns");
-    if !is_proxy_error(reason) && !connectish {
+    if !should_heal_client(reason) {
         return;
     }
     let mut last = match LAST_HEAL.lock() {
@@ -1190,6 +1198,26 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_recovery_matches_lowercase_transport_errors() {
+        for error in [
+            "error sending request: tcp connect error: connection reset",
+            "proxy CONNECT tunnel failed",
+            "connection refused",
+            "operation timed out",
+            "dns error: failed to lookup address",
+        ] {
+            assert!(should_heal_client(error), "{error}");
+        }
+        for error in [
+            "HTTP 403 Forbidden",
+            "certificate validation failed",
+            "HTTP 404 Not Found",
+        ] {
+            assert!(!should_heal_client(error), "{error}");
+        }
+    }
 
     #[test]
     fn proxy_selection_respects_target_scheme_and_direct_decisions() {
