@@ -120,12 +120,10 @@ fn proxy_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// 按**当前**系统代理设置新建一个客户端。
-///
-/// 注意：reqwest 的 `system-proxy` 只在构建时读一次注册表 / 环境变量。代理软件被关掉后，
-/// 旧客户端仍会往 `127.0.0.1:7897` 建隧道，症状是满屏 `tunnel error: failed to create
-/// underlying connection`（浏览器却是通的，因为它每次都重读系统代理）。所以这里允许重建。
-fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+/// 按目标 URL 新建客户端。Windows PAC/WPAD 必须先经 WinHTTP 解析，
+/// 因为 reqwest 的 system-proxy 只读取固定代理，不执行浏览器的 PAC 脚本。
+fn build_client(target: &url::Url, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
+    let host = target.host_str().ok_or("目标缺少主机名")?;
     let mut builder = reqwest::Client::builder()
         .user_agent(UA)
         .timeout(Duration::from_secs(20))
@@ -138,14 +136,216 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
     if !addrs.is_empty() {
         builder = builder.resolve_to_addrs(host, addrs);
     }
+
     if let Some(p) = proxy_override() {
-        // 错误信息不能含原始代理 URL（其中可能有用户名/密码）。
+        // 用户显式代理优先于系统代理；不允许 system-proxy 再覆盖选择。
         let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUB_PROXY 配置无效（已隐藏原始值）")?;
-        builder = builder.proxy(proxy);
+        builder = builder.no_proxy().proxy(proxy);
+    } else {
+        #[cfg(windows)]
+        if let Some(proxy) = windows_pac_proxy(target)? {
+            match proxy {
+                Some(proxy_url) => {
+                    let proxy = reqwest::Proxy::all(&proxy_url)
+                        .map_err(|_| "Windows PAC 返回了无效代理（原始值已隐藏）")?;
+                    builder = builder.no_proxy().proxy(proxy);
+                }
+                None => {
+                    // PAC 明确返回 DIRECT，必须覆盖 reqwest 的固定代理自动探测。
+                    builder = builder.no_proxy();
+                }
+            }
+        }
     }
-    builder
-        .build()
-        .map_err(|_| "无法创建 HTTP 客户端".to_string())
+    builder.build().map_err(|_| "无法创建 HTTP 客户端".to_string())
+}
+
+#[cfg(windows)]
+fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String> {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    type InternetHandle = *mut c_void;
+    const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+    const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+    const WINHTTP_AUTOPROXY_AUTO_DETECT: u32 = 0x00000001;
+    const WINHTTP_AUTOPROXY_CONFIG_URL: u32 = 0x00000002;
+    const WINHTTP_AUTO_DETECT_TYPE_DHCP: u32 = 0x00000001;
+    const WINHTTP_AUTO_DETECT_TYPE_DNS_A: u32 = 0x00000002;
+
+    #[repr(C)]
+    struct IeProxyConfig {
+        auto_detect: i32,
+        auto_config_url: *mut u16,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+    #[repr(C)]
+    struct AutoProxyOptions {
+        flags: u32,
+        auto_detect_flags: u32,
+        auto_config_url: *mut u16,
+        reserved: *mut c_void,
+        reserved2: u32,
+        auto_logon_if_challenged: i32,
+    }
+    #[repr(C)]
+    struct ProxyInfo {
+        access_type: u32,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+
+    #[link(name = "winhttp")]
+    unsafe extern "system" {
+        fn WinHttpOpen(
+            agent: *const u16,
+            access_type: u32,
+            proxy: *const u16,
+            bypass: *const u16,
+            flags: u32,
+        ) -> InternetHandle;
+        fn WinHttpGetIEProxyConfigForCurrentUser(config: *mut IeProxyConfig) -> i32;
+        fn WinHttpGetProxyForUrl(
+            session: InternetHandle,
+            url: *const u16,
+            options: *mut AutoProxyOptions,
+            info: *mut ProxyInfo,
+        ) -> i32;
+        fn WinHttpCloseHandle(handle: InternetHandle) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    unsafe fn take_wide(value: *mut u16) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        GlobalFree(value.cast());
+        Some(result)
+    }
+    fn bypasses_host(list: &str, target: &url::Url) -> bool {
+        let Some(host) = target.host_str() else { return false };
+        list.split([';', ',']).map(str::trim).filter(|v| !v.is_empty()).any(|rule| {
+            if rule.eq_ignore_ascii_case("<local>") {
+                return !host.contains('.');
+            }
+            let rule = rule.split(':').next().unwrap_or(rule).trim_start_matches('.');
+            if let Some(suffix) = rule.strip_prefix("*.") {
+                host.eq_ignore_ascii_case(suffix)
+                    || host.to_ascii_lowercase().ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+            } else {
+                host.eq_ignore_ascii_case(rule)
+            }
+        })
+    }
+    fn choose_proxy(raw: &str, scheme: &str) -> Option<String> {
+        let selected = raw.split(';').map(str::trim).filter(|v| !v.is_empty()).find_map(|entry| {
+            if let Some((protocol, value)) = entry.split_once('=') {
+                protocol.trim().eq_ignore_ascii_case(scheme).then(|| value.trim())
+            } else {
+                Some(entry)
+            }
+        })?;
+        if selected.eq_ignore_ascii_case("DIRECT") || selected.is_empty() {
+            return None;
+        }
+        let selected = selected.split(';').next().unwrap_or(selected).trim();
+        if selected.contains("://") {
+            Some(selected.to_string())
+        } else {
+            Some(format!("http://{selected}"))
+        }
+    }
+
+    let mut config = IeProxyConfig {
+        auto_detect: 0,
+        auto_config_url: null_mut(),
+        proxy: null_mut(),
+        proxy_bypass: null_mut(),
+    };
+    let loaded = unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut config) != 0 };
+    if !loaded {
+        return Ok(None);
+    }
+    let pac_url = unsafe { take_wide(config.auto_config_url) };
+    let _fixed_proxy = unsafe { take_wide(config.proxy) };
+    let _fixed_bypass = unsafe { take_wide(config.proxy_bypass) };
+    if pac_url.is_none() && config.auto_detect == 0 {
+        return Ok(None);
+    }
+
+    let agent = wide(UA);
+    let session = unsafe {
+        WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            null(),
+            null(),
+            0,
+        )
+    };
+    if session.is_null() {
+        return Err("Windows PAC 解析器初始化失败".into());
+    }
+    let target_wide = wide(target.as_str());
+    let mut options = AutoProxyOptions {
+        flags: if pac_url.is_some() {
+            WINHTTP_AUTOPROXY_CONFIG_URL
+        } else {
+            WINHTTP_AUTOPROXY_AUTO_DETECT
+        },
+        auto_detect_flags: if pac_url.is_none() {
+            WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
+        } else {
+            0
+        },
+        auto_config_url: pac_url.as_ref().map_or(null_mut(), |v| wide(v).as_mut_ptr()),
+        reserved: null_mut(),
+        reserved2: 0,
+        auto_logon_if_challenged: 1,
+    };
+    // 保留 PAC URL 的 UTF-16 缓冲区，直到 WinHttpGetProxyForUrl 返回。
+    let pac_wide = pac_url.as_ref().map(|v| wide(v));
+    options.auto_config_url = pac_wide.as_ref().map_or(null_mut(), |v| v.as_ptr() as *mut u16);
+    let mut info = ProxyInfo {
+        access_type: 0,
+        proxy: null_mut(),
+        proxy_bypass: null_mut(),
+    };
+    let resolved = unsafe {
+        WinHttpGetProxyForUrl(session, target_wide.as_ptr(), &mut options, &mut info) != 0
+    };
+    unsafe { WinHttpCloseHandle(session); }
+    if !resolved {
+        return Err("Windows PAC/WPAD 代理解析失败；为避免错误直连，媒体请求已阻止".into());
+    }
+    let proxy = unsafe { take_wide(info.proxy) }.unwrap_or_default();
+    let bypass = unsafe { take_wide(info.proxy_bypass) }.unwrap_or_default();
+    let direct = info.access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY
+        || bypasses_host(&bypass, target);
+    if direct {
+        Ok(Some(None))
+    } else {
+        let chosen = choose_proxy(&proxy, target.scheme())
+            .ok_or("Windows PAC 未返回适用于当前协议的代理")?;
+        Ok(Some(Some(chosen)))
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_pac_proxy(_target: &url::Url) -> Result<Option<Option<String>>, String> {
+    Ok(None)
 }
 
 const CLIENT_TTL: Duration = Duration::from_secs(30);
@@ -178,7 +378,7 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     } else {
         Vec::new()
     };
-    let http = Arc::new(build_client(host, &addrs)?);
+    let http = Arc::new(build_client(&target, &addrs)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
     // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
