@@ -385,6 +385,39 @@ fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
     json!({ "count": ips.len(), "has_fake_ip": has_fake_ip })
 }
 
+/// 只读取 Windows 当前用户 Internet Settings 的代理开关，不读取或输出代理地址/PAC URL。
+#[cfg(windows)]
+fn windows_proxy_diagnostics() -> Value {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let settings = match hkcu.open_subkey(path) {
+        Ok(key) => key,
+        Err(_) => return json!({"registry_readable": false}),
+    };
+    let proxy_enable = settings.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
+    let fixed_proxy_configured = settings.get_value::<String, _>("ProxyServer").is_ok_and(|v| !v.trim().is_empty());
+    let pac_configured = settings.get_value::<String, _>("AutoConfigURL").is_ok_and(|v| !v.trim().is_empty());
+    let auto_detect = settings.get_value::<u32, _>("AutoDetect").unwrap_or(0) != 0;
+    // WinINet connection blob 的 flags 字节：0x08 表示自动检测（WPAD）。仅提取该位。
+    let connections = hkcu.open_subkey(format!(r"{path}\Connections")).ok();
+    let connection_wpad = connections
+        .and_then(|key| key.get_value::<Vec<u8>, _>("DefaultConnectionSettings").ok())
+        .and_then(|bytes| bytes.get(8).copied())
+        .is_some_and(|flags| flags & 0x08 != 0);
+    json!({
+        "registry_readable": true,
+        "fixed_proxy_enabled": proxy_enable,
+        "fixed_proxy_configured": fixed_proxy_configured,
+        "pac_configured": pac_configured,
+        "wpad_enabled": auto_detect || connection_wpad,
+    })
+}
+
+#[cfg(not(windows))]
+fn windows_proxy_diagnostics() -> Value { json!({"supported": false}) }
+
 /// 网络自检：DNS / HTTP / 代理相关环境变量，用于远程定位「打不开」。
 pub async fn diagnose() -> Value {
     let cur = base();
@@ -421,6 +454,7 @@ pub async fn diagnose() -> Value {
 
     json!({
         "base": cur,
+        "windows_proxy": windows_proxy_diagnostics(),
         "host": host,
         "dns": dns,
         "http": http,
