@@ -509,16 +509,45 @@ mod tests {
     #[ignore = "联网验收：依赖上游实时播放地址，手动用 --ignored 运行"]
     async fn live_play_chain() {
         use crate::net::edge;
-        let play = edge(
-            &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
+        let origin = crate::net::base();
+        // Mirror api_play(): the current upstream prefers POST /episodes/{ep}/playback.
+        // The legacy GET endpoint is only a fallback when the primary response has no stream.
+        let primary = edge(
+            &origin,
+            "POST",
+            "/api/videos/117/episodes/3/playback",
+            Some(serde_json::json!({})),
             None,
         )
-        .await
-        .expect("play api");
-        // edge() returns the raw upstream response; the new API stores the URL in streams.main.
+        .await;
+        let has_stream = |value: &serde_json::Value| {
+            value
+                .get("video_url")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| !url.is_empty())
+                || value
+                    .get("streams")
+                    .and_then(|streams| streams.get("main"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+        };
+        let play = match primary {
+            Ok(value) if has_stream(&value) => value,
+            primary_result => {
+                let legacy = edge(
+                    &origin,
+                    "GET",
+                    "/api/videos/117/play?ep=3&page_texts=0",
+                    None,
+                    None,
+                )
+                .await;
+                match legacy {
+                    Ok(value) if has_stream(&value) => value,
+                    _ => primary_result.expect("primary playback API returned no stream"),
+                }
+            }
+        };
         let url = play
             .get("video_url")
             .and_then(serde_json::Value::as_str)
