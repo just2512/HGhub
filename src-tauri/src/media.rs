@@ -518,7 +518,15 @@ mod tests {
         )
         .await
         .expect("play api");
-        let url = play["video_url"].as_str().expect("video_url").to_string();
+        // edge() returns the raw upstream response; the new API stores the URL in streams.main.
+        let url = play
+            .get("video_url")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or_else(|| play.get("streams").and_then(|streams| streams.get("main")).and_then(serde_json::Value::as_str))
+            .filter(|value| !value.is_empty())
+            .expect("play response contains video_url or streams.main")
+            .to_string();
 
         let master = handle("/hls", &format!("u={}", enc(&url)), LOCAL_ORIGIN).await;
         assert_eq!(master.status(), 200, "master playlist HTTP status");
