@@ -63,6 +63,7 @@ pub async fn line_state() -> Result<Value, String> {
         "base": base(),
         "default": crate::net::DEFAULT_BASE,
         "fixed": crate::lines::fixed(),
+        "custom": crate::sources::list(),
     }))
 }
 
@@ -91,6 +92,18 @@ pub async fn line_probe(urls: Vec<String>) -> Result<Value, String> {
     crate::net::refresh_client();
     Ok(crate::lines::probe(urls).await)
 }
+
+/// 先请求真实 Edge V1 业务 API，成功后才保存自定义数据源。
+#[tauri::command]
+pub async fn line_add_custom(name: String, url: String) -> Result<Value, String> {
+    let origin = crate::net::normalize_base(&url).ok_or("数据源地址无效：必须是公网 HTTPS 站点根地址")?;
+    crate::net::refresh_client();
+    let data = crate::net::edge(&origin, "GET", "/api/videos?page=1&size=1", None, None).await?;
+    if data.is_null() { return Err("数据源 API 返回空数据，未保存".into()); }
+    Ok(json!(crate::sources::add(&name, &origin)?))
+}
+#[tauri::command]
+pub async fn line_remove_custom(url: String) -> Result<(), String> { crate::sources::remove(&url) }
 
 /* ───────────────────────── 更新检查 ───────────────────────── */
 

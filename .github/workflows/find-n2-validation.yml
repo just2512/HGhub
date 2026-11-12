@@ -1,0 +1,121 @@
+name: Find N2 validation
+
+on:
+  push:
+    branches: [feat/find-n2-source-foldable]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source:
+        description: HTTPS Edge V1 source origin for real-media acceptance
+        required: false
+        default: https://huangguoai.com
+      video_id:
+        description: Public video ID with an available episode
+        required: false
+        default: "117"
+      episode:
+        description: Episode number
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: find-n2-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-and-rust:
+    name: Frontend + Rust regression
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+  android-arm64:
+    name: Android ARM64 installable test APK
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare Android SDK and NDK
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: find-n2-android-arm64
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri android init --ci
+      - run: pnpm tauri android build --apk --target aarch64
+      - name: Sign test APK with ephemeral CI key
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          keytool -genkeypair -v -keystore "$RUNNER_TEMP/find-n2-test.jks" -storepass changeit -keypass changeit -alias test -keyalg RSA -keysize 2048 -validity 2 -dname "CN=HGhub CI Test"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          found=0
+          while IFS= read -r -d '' apk; do
+            out="artifacts/$(basename "$apk" .apk)-ci-signed.apk"
+            "$ANDROID_SDK_ROOT/build-tools/$BT/apksigner" sign --ks "$RUNNER_TEMP/find-n2-test.jks" --ks-key-alias test --ks-pass pass:changeit --key-pass pass:changeit --out "$out" "$apk"
+            "$ANDROID_SDK_ROOT/build-tools/$BT/apksigner" verify "$out"
+            found=$((found+1))
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -print0)
+          test "$found" -gt 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hghub-find-n2-arm64-test-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  live-media:
+    name: Real upstream API + HLS media chain
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Run real upstream playback acceptance (no fixtures)
+        env:
+          HGHUB_TEST_SOURCE: ${{ inputs.source || 'https://huangguoai.com' }}
+          HGHUB_TEST_VIDEO_ID: ${{ inputs.video_id || '117' }}
+          HGHUB_TEST_EPISODE: ${{ inputs.episode || '3' }}
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib media::tests::live_play_chain -- --ignored --nocapture

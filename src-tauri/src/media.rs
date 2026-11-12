@@ -464,23 +464,32 @@ mod tests {
         assert!(bom.body().starts_with(b"#EXTM3U\n"));
     }
 
-    /// 联网测试：默认跳过，手动跑 `cargo test --lib -- --ignored`。
-    /// 依赖上游 `/api/videos/117/play` 返回的实时播放地址。
+    /// 真实上游验收：默认跳过；可通过 HGHUB_TEST_SOURCE / HGHUB_TEST_VIDEO_ID / HGHUB_TEST_EPISODE 指定。
+    /// 验证 Edge V1 播放 API、Rust m3u8 代理、重写后的 KEY/分片地址和真实分片字节。
     #[tokio::test]
-    #[ignore = "联网测试：依赖上游实时播放地址，手动用 --ignored 运行"]
+    #[ignore = "联网验收：请求真实上游 API/CDN，手动用 --ignored 运行"]
     async fn live_play_chain() {
-        use crate::net::edge;
-        let play = edge(
-            &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
-            None,
-        )
-        .await
-        .expect("play api");
+        use crate::net::{edge, set_base};
+        let origin = std::env::var("HGHUB_TEST_SOURCE").unwrap_or_else(|_| crate::net::base());
+        set_base(&origin).expect("valid HTTPS source");
+        let video_id = std::env::var("HGHUB_TEST_VIDEO_ID").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(117);
+        let episode = std::env::var("HGHUB_TEST_EPISODE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(3);
+        let path = format!("/api/videos/{video_id}/episodes/{episode}/playback");
+        let primary = edge(&origin, "POST", &path, Some(serde_json::json!({})), None).await;
+        let play = match primary {
+            Ok(mut value) => {
+                if value.get("video_url").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty()) {
+                    if let Some(main) = value.get("streams").and_then(|v| v.get("main")).and_then(|v| v.as_str()) {
+                        value["video_url"] = serde_json::json!(main);
+                    }
+                }
+                if value.get("video_url").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) { value }
+                else { edge(&origin, "GET", &format!("/api/videos/{video_id}/play?ep={episode}&page_texts=0"), None, None).await.expect("legacy playback api") }
+            }
+            Err(_) => edge(&origin, "GET", &format!("/api/videos/{video_id}/play?ep={episode}&page_texts=0"), None, None).await.expect("legacy playback api"),
+        };
         let url = play["video_url"].as_str().expect("video_url").to_string();
-        println!("play url: {}", &url[..url.len().min(90)]);
+        println!("play resource: {}", crate::playback_log::resource_id(&url));
         let (_, bytes) = fetch_bytes(&url).await.expect("fetch playlist");
         let text = String::from_utf8_lossy(&bytes);
         println!(

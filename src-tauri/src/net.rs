@@ -47,7 +47,7 @@ pub fn base() -> String {
 
 /// 线路必须是纯 HTTPS origin，不允许路径、认证、查询串或片段。
 pub fn normalize_base(raw: &str) -> Option<String> {
-    let parsed = network_policy::parse_target(raw.trim()).ok()?;
+    let parsed = network_policy::parse_target_with_mode(raw.trim(), true).ok()?;
     if parsed.scheme() != "https"
         || parsed.path() != "/"
         || parsed.query().is_some()
@@ -473,12 +473,11 @@ pub async fn edge(
     token: Option<&str>,
 ) -> Result<Value, String> {
     let cur = normalize_base(origin).ok_or("业务请求必须使用安全 HTTPS 线路")?;
-    if network_policy::strict_security()
-        && (token.is_some()
-            || matches!(
-                path,
-                "/api/account/loginByPassword" | "/api/account/registerByPassword"
-            ))
+    if (token.is_some()
+        || matches!(
+            path,
+            "/api/account/loginByPassword" | "/api/account/registerByPassword"
+        ))
         && !trusted_auth_origin(&cur)
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());

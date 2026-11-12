@@ -91,10 +91,31 @@ function AppBody() {
   useLayoutEffect(() => {
     const el = mainRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setWide(el.clientWidth > 640));
+    const updateLayout = () => {
+      const rect = el.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      const nextWide = width > 640;
+      el.dataset.layout = nextWide ? "wide" : "compact";
+      el.style.setProperty("--app-viewport-height", `${height}px`);
+      setWide((previous) => {
+        if (previous !== nextWide) tracePlayback("viewport.layout", {
+          width, height, layout: nextWide ? "wide" : "compact",
+          orientation: window.innerWidth > window.innerHeight ? "landscape" : "portrait",
+        });
+        return nextWide;
+      });
+    };
+    const ro = new ResizeObserver(updateLayout);
     ro.observe(el);
-    setWide(el.clientWidth > 640);
-    return () => ro.disconnect();
+    window.addEventListener("orientationchange", updateLayout);
+    window.visualViewport?.addEventListener("resize", updateLayout);
+    updateLayout();
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("orientationchange", updateLayout);
+      window.visualViewport?.removeEventListener("resize", updateLayout);
+    };
   }, []);
 
   /* 全局键盘 */
