@@ -21,6 +21,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: hghub-windows-media-validation
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
