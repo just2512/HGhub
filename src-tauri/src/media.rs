@@ -479,9 +479,8 @@ mod tests {
         let play = match primary {
             Ok(mut value) => {
                 if value.get("video_url").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty()) {
-                    if let Some(main) = value.get("streams").and_then(|v| v.get("main")).and_then(|v| v.as_str()) {
-                        value["video_url"] = serde_json::json!(main);
-                    }
+                    let main = value.get("streams").and_then(|v| v.get("main")).and_then(|v| v.as_str()).map(str::to_owned);
+                    if let Some(main) = main { value["video_url"] = serde_json::json!(main); }
                 }
                 if value.get("video_url").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) { value }
                 else { edge(&origin, "GET", &format!("/api/videos/{video_id}/play?ep={episode}&page_texts=0"), None, None).await.expect("legacy playback api") }
