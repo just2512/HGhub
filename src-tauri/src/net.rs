@@ -373,11 +373,6 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
         fn GlobalFree(memory: *mut c_void) -> *mut c_void;
     }
 
-    // WinHTTP 在同一个 session 中缓存自动发现结果与 PAC 脚本。
-    // 复用 session 避免每个 HLS 分片都重新发现/下载 PAC；配置变化或 5 分钟后刷新。
-    static WINHTTP_SESSION: Lazy<Mutex<(usize, String, Instant)>> =
-        Lazy::new(|| Mutex::new((0, String::new(), Instant::now())));
-
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -419,7 +414,10 @@ fn windows_pac_proxy(target: &url::Url) -> Result<Option<Option<String>>, String
     let mut session_cache = WINHTTP_SESSION
         .lock()
         .map_err(|_| "Windows PAC session 锁失败")?;
-    if session_cache.0 == 0
+    let reset_requested =
+        WINHTTP_SESSION_RESET.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if reset_requested
+        || session_cache.0 == 0
         || session_cache.1 != config_key
         || Instant::now() >= session_cache.2
     {
@@ -511,6 +509,13 @@ type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static VERIFIED_DNS: Lazy<Mutex<DnsCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(windows)]
+static WINHTTP_SESSION: Lazy<Mutex<(usize, String, Instant)>> =
+    Lazy::new(|| Mutex::new((0, String::new(), Instant::now())));
+#[cfg(windows)]
+static WINHTTP_SESSION_RESET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn cached_dns(cache: &DnsCache, key: &str, now: Instant) -> Option<Vec<SocketAddr>> {
     cache
         .get(key)
@@ -591,6 +596,8 @@ pub fn refresh_client() {
     if let Ok(mut cache) = VERIFIED_DNS.lock() {
         cache.clear();
     }
+    #[cfg(windows)]
+    WINHTTP_SESSION_RESET.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// 不可信 GET 的统一入口；自动重定向被关闭，每一跳重新检查 URL、DNS 并固定解析地址。
