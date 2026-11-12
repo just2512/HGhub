@@ -449,7 +449,16 @@ fn windows_pac_proxy(_target: &url::Url) -> Result<Option<Option<String>>, Strin
 
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
+type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static VERIFIED_DNS: Lazy<Mutex<DnsCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn cached_dns(cache: &DnsCache, key: &str, now: Instant) -> Option<Vec<SocketAddr>> {
+    cache
+        .get(key)
+        .filter(|(expires, _)| now < *expires)
+        .map(|(_, addrs)| addrs.clone())
+}
 
 fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
     cache
@@ -465,20 +474,41 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
+    let dns_key = format!("{strict}:{host}:{port}");
+    // 先复用或重新校验 DNS 结果，再执行可能联网的 PAC/WPAD 解析。
+    // DNS 结果与客户端分开缓存，避免 PAC 按路径分流时绕过目标地址安全检查。
+    let addrs = if strict {
+        let cached = {
+            let cache = VERIFIED_DNS.lock().map_err(|_| "DNS 缓存锁失败")?;
+            cached_dns(&cache, &dns_key, Instant::now())
+        };
+        match cached {
+            Some(addrs) => addrs,
+            None => {
+                let addrs = network_policy::resolve_target(&target, strict).await?;
+                let now = Instant::now();
+                let mut cache = VERIFIED_DNS.lock().map_err(|_| "DNS 缓存锁失败")?;
+                cache.retain(|_, (expires, _)| now < *expires);
+                if cache.len() >= 64 {
+                    cache.clear();
+                }
+                cache.insert(dns_key.clone(), (now + CLIENT_TTL, addrs.clone()));
+                addrs
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // PAC 对完整 URL 求值：不同路径可能命中不同代理，但相同代理结果仍共享连接池。
     let proxy_mode = proxy_for_target(&target)?;
-    let key = format!("{strict}:{host}:{port}:{}", proxy_mode.cache_fragment());
+    let key = format!("{dns_key}:{}", proxy_mode.cache_fragment());
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
             return Ok((target, http));
         }
     }
-    let addrs = if strict {
-        network_policy::resolve_target(&target, strict).await?
-    } else {
-        Vec::new()
-    };
     let http = Arc::new(build_client(&target, &addrs, &proxy_mode)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
@@ -496,6 +526,9 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
 
 pub fn refresh_client() {
     if let Ok(mut cache) = CLIENTS.lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = VERIFIED_DNS.lock() {
         cache.clear();
     }
 }
@@ -1231,6 +1264,18 @@ mod tests {
             dns_summary(Vec::<SocketAddr>::new()),
             json!({"count":0,"has_fake_ip":false})
         );
+    }
+
+    #[test]
+    fn verified_dns_cache_expires_at_its_original_ttl() {
+        let now = Instant::now();
+        let key = "true:media.example.net:443";
+        let addrs = vec!["203.0.113.10:443".parse().unwrap()];
+        let mut cache = DnsCache::new();
+        cache.insert(key.into(), (now + CLIENT_TTL, addrs.clone()));
+        assert_eq!(cached_dns(&cache, key, now + Duration::from_secs(29)), Some(addrs));
+        assert!(cached_dns(&cache, key, now + CLIENT_TTL).is_none());
+        assert!(cached_dns(&cache, "false:media.example.net:443", now).is_none());
     }
 
     #[test]
