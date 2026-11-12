@@ -1136,6 +1136,110 @@ pub struct FetchedBytes {
     pub content_range: Option<String>,
 }
 
+/// 解析单段 Range，并根据完整实体长度得到实际的闭区间。
+fn resolve_byte_range(value: &str, total: u64) -> Result<Option<(u64, u64)>, String> {
+    let spec = value.strip_prefix("bytes=").ok_or("不支持的 Range 单位")?;
+    if spec.contains(',') {
+        return Err("不支持多段 Range".into());
+    }
+    let (start, end) = spec.split_once('-').ok_or("Range 格式无效")?;
+    if end.contains('-') {
+        return Err("Range 格式无效".into());
+    }
+    if total == 0 {
+        return Ok(None);
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| "Range 后缀长度无效")?;
+        if suffix == 0 {
+            return Err("Range 后缀长度不能为零".into());
+        }
+        let length = suffix.min(total);
+        return Ok(Some((total - length, total - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| "Range 起始位置无效")?;
+    let requested_end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().map_err(|_| "Range 结束位置无效")?
+    };
+    if requested_end < start || start >= total {
+        return Ok(None);
+    }
+    Ok(Some((start, requested_end.min(total - 1))))
+}
+
+/// 校验上游 206，或在上游忽略 Range 返回完整 200 时本地切片。
+/// 这保证 BYTERANGE 得到的永远是所请求的字节区间，而不是整份文件。
+fn normalize_range_response(
+    range: Option<&str>,
+    status: u16,
+    content_range: Option<String>,
+    bytes: Vec<u8>,
+) -> Result<(u16, Vec<u8>, Option<String>), String> {
+    let Some(range) = range else {
+        if status == 206 {
+            let header = content_range.as_deref().ok_or("HTTP 206 缺少 Content-Range")?;
+            let (start, end, total) = parse_content_range(header)?;
+            let expected_len = end - start + 1;
+            if total <= end || bytes.len() as u64 != expected_len {
+                return Err("HTTP 206 的 Content-Range 与响应字节数不一致".into());
+            }
+        }
+        return Ok((status, bytes, content_range));
+    };
+
+    match status {
+        200 => {
+            let total = u64::try_from(bytes.len()).map_err(|_| "媒体响应过大")?;
+            match resolve_byte_range(range, total)? {
+                Some((start, end)) => {
+                    let part = bytes[start as usize..=end as usize].to_vec();
+                    let header = format!("bytes {start}-{end}/{total}");
+                    Ok((206, part, Some(header)))
+                }
+                None => Ok((416, Vec::new(), Some(format!("bytes */{total}")))),
+            }
+        }
+        206 => {
+            let header = content_range.as_deref().ok_or("HTTP 206 缺少 Content-Range")?;
+            let (actual_start, actual_end, total) = parse_content_range(header)?;
+            let expected = resolve_byte_range(range, total)?
+                .ok_or("上游返回了不可满足的 Range 响应")?;
+            if (actual_start, actual_end) != expected {
+                return Err("上游 HTTP 206 返回的字节区间与请求不一致".into());
+            }
+            if bytes.len() as u64 != actual_end - actual_start + 1 {
+                return Err("上游 HTTP 206 的 Content-Range 与响应字节数不一致".into());
+            }
+            Ok((206, bytes, content_range))
+        }
+        416 => {
+            let header = content_range.as_deref().ok_or("HTTP 416 缺少 Content-Range")?;
+            let total = header
+                .strip_prefix("bytes */")
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("HTTP 416 的 Content-Range 无效")?;
+            Ok((416, bytes, Some(format!("bytes */{total}"))))
+        }
+        _ => Err(format!("上游未正确处理 Range：HTTP {status}")),
+    }
+}
+
+/// 解析 RFC 9110 的单段 Content-Range（仅接受已知实体总长度）。
+fn parse_content_range(value: &str) -> Result<(u64, u64, u64), String> {
+    let spec = value.strip_prefix("bytes ").ok_or("Content-Range 单位无效")?;
+    let (range, total) = spec.split_once('/').ok_or("Content-Range 缺少总长度")?;
+    let total = total.parse::<u64>().map_err(|_| "Content-Range 总长度无效")?;
+    let (start, end) = range.split_once('-').ok_or("Content-Range 区间无效")?;
+    let start = start.parse::<u64>().map_err(|_| "Content-Range 起始位置无效")?;
+    let end = end.parse::<u64>().map_err(|_| "Content-Range 结束位置无效")?;
+    if total == 0 || end < start || end >= total {
+        return Err("Content-Range 区间越界".into());
+    }
+    Ok((start, end, total))
+}
+
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
     let fetched = fetch_bytes_with_range(url, None).await?;
@@ -1185,9 +1289,6 @@ pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<Fe
                     .and_then(|v| v.to_str().ok()).map(str::to_string);
                 let content_range = resp.headers().get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok()).map(str::to_string);
-                if response_status == 206 && content_range.is_none() {
-                    return Err("HTTP 206 缺少 Content-Range".into());
-                }
                 let bytes = resp.bytes().await.map_err(|e| {
                     crate::playback_log::record("network.transport_failed", json!({
                         "host": host, "scheme": scheme, "port": port, "phase": "body",
@@ -1196,7 +1297,9 @@ pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<Fe
                     }));
                     err_text(&e)
                 })?.to_vec();
-                Ok(FetchedBytes { content_type: ctype, bytes, status: response_status, content_range })
+                let (status, bytes, content_range) =
+                    normalize_range_response(range.as_deref(), response_status, content_range, bytes)?;
+                Ok(FetchedBytes { content_type: ctype, bytes, status, content_range })
             }.await;
             crate::playback_log::record("network.end", json!({
                 "request": request, "resource": resource, "attempt": attempt,
@@ -1213,6 +1316,82 @@ pub async fn fetch_bytes_with_range(url: &str, range: Option<&str>) -> Result<Fe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_fallback_slices_full_200_responses() {
+        let source = b"0123456789";
+        let (status, bytes, content_range) = normalize_range_response(
+            Some("bytes=3-6"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(bytes, b"3456");
+        assert_eq!(content_range.as_deref(), Some("bytes 3-6/10"));
+    }
+
+    #[test]
+    fn range_fallback_supports_open_ended_and_suffix_ranges() {
+        let source = b"0123456789";
+        let (status, open, header) = normalize_range_response(
+            Some("bytes=8-"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(open, b"89");
+        assert_eq!(header.as_deref(), Some("bytes 8-9/10"));
+
+        let (status, suffix, header) = normalize_range_response(
+            Some("bytes=-3"),
+            200,
+            None,
+            source.to_vec(),
+        ).unwrap();
+        assert_eq!(status, 206);
+        assert_eq!(suffix, b"789");
+        assert_eq!(header.as_deref(), Some("bytes 7-9/10"));
+    }
+
+    #[test]
+    fn range_fallback_returns_416_when_requested_start_is_out_of_bounds() {
+        let (status, bytes, header) = normalize_range_response(
+            Some("bytes=20-30"),
+            200,
+            None,
+            b"0123456789".to_vec(),
+        ).unwrap();
+        assert_eq!(status, 416);
+        assert!(bytes.is_empty());
+        assert_eq!(header.as_deref(), Some("bytes */10"));
+    }
+
+    #[test]
+    fn upstream_partial_range_must_match_requested_bytes_and_body_length() {
+        let ok = normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 3-6/10".into()),
+            b"3456".to_vec(),
+        ).unwrap();
+        assert_eq!(ok.0, 206);
+        assert_eq!(ok.1, b"3456");
+
+        assert!(normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 2-5/10".into()),
+            b"2345".to_vec(),
+        ).is_err());
+        assert!(normalize_range_response(
+            Some("bytes=3-6"),
+            206,
+            Some("bytes 3-6/10".into()),
+            b"345".to_vec(),
+        ).is_err());
+    }
 
     #[test]
     fn connection_recovery_matches_lowercase_transport_errors() {
